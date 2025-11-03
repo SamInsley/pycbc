@@ -74,7 +74,7 @@ def logsignalrateinternals_computepsignalbins(
     for idx in range(length):
         tbin[idx] = tdif[idx]
         pbin[idx] = pdif[idx]
-        sbin[idx] = numpy.log(sdif[idx])
+        sbin[idx] = sdif[idx]
 
 
 @boundscheck(False)
