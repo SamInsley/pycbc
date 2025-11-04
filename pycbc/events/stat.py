@@ -1,4 +1,45 @@
+# Copyright (C) 2016 Alex Nitz
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
+#
+# =============================================================================
+#
+#                                   Preamble
+#
+# =============================================================================
+#
+"""
+This module contains functions for calculating coincident ranking statistic
+values.
+"""
+import logging
+import numpy
+import h5py
+from . import ranking
+from . import coinc_rate
+from .eventmgr_cython import logsignalrateinternals_computepsignalbins
+from .eventmgr_cython import logsignalrateinternals_compute2detrate
+from . import ml_stat
+from .ml_stat import MLStatistic
+
+logger = logging.getLogger('pycbc.events.stat')
+
+
+class Stat(object):
+    """Base class which should be extended to provide a coincident statistic"""
     def __init__(self, sngl_ranking, files=None, ifos=None, **kwargs):
         """
         Create a statistic class instance
@@ -302,7 +343,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.relsense = {}
         self.srmax = 5.
         self.srmin = .2
-        
+        self.hist_max = 300. 
         # Some memory
         self.pdif = numpy.zeros(128, dtype=numpy.float64)
         self.tdif = numpy.zeros(128, dtype=numpy.float64)
@@ -314,7 +355,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         # Is the histogram needed to be pre-generated?
         hist_needed = pregenerate_hist
         hist_needed &= not len(ifos) == 1
-        hist_needed &= (type(self).__name__ == "PhaseTD" or self.kwargs["phasetd"])
+        #hist_needed &= (type(self).__name__ == "PhaseTD" or self.kwargs["phasetd"])
 
         if hist_needed:
             self.get_hist()
@@ -372,8 +413,8 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         logger.info("Using signal histogram %s for ifos %s", selected, ifos)
         
         self.model = MLStatistic.from_file(self.files[selected], group_name="model")
-        self.model_ifos = model.metadata.get("ifos")
-        self.model_relfac = model.metadata.get("relfac")
+        self.model_ifos = self.model.metadata.get("ifos")
+        self.model_relfac = self.model.metadata.get("relfac")
 
         for ifo, sense in zip(self.model_ifos, self.model_relfac):
             self.relsense[ifo] = sense
@@ -443,7 +484,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         sigs = {ifo: numpy.array(stats[ifo]['sigmasq'],
                                  dtype=numpy.float32, ndmin=1)
                 for ifo in self.ifos}
-        for ref_ifo in self.model_ifos[0]:
+        for ref_ifo in [self.model_ifos[0]]:
             pref = ps[ref_ifo]
             tref = ts[ref_ifo]
             sref = ss[ref_ifo]
@@ -469,9 +510,6 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     self.pdif,
                     self.tdif,
                     self.sdif,
-                    self.pbin,
-                    self.tbin,
-                    self.sbin,
                     ps[ifo],
                     ts[ifo],
                     ss[ifo],
@@ -483,24 +521,22 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     shift,
                     self.relsense[ifo],
                     senseref,
-                    self.twidth,
-                    self.pwidth,
-                    self.swidth,
                     to_shift[ref_ifo],
                     to_shift[ifo],
                     length,
                 )
 
                 binned += [
-                    self.tbin[:length],
-                    self.pbin[:length],
-                    self.sbin[:length],
+                    self.tdif[:length],
+                    self.pdif[:length],
+                    self.sdif[:length],
                 ]
 
             # Read signal weight from precalculated histogram
+            x = numpy.column_stack(binned).astype(numpy.float32)
             snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
             smin = snrs.min(axis=0)
-            rate = self.model.log_prob(binned)
+            rate = self.model.log_prob(x)
             rate += numpy.log((smin / self.ref_snr) ** -4.)
 
         return rate
@@ -1442,12 +1478,12 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # coincs
         # Extent of time-difference space occupied
         noise_twindow = coinc_rate.multiifo_noise_coincident_area(
-                            self.hist_ifos, kwargs['time_addition'])
+                            self.model_ifos, kwargs['time_addition'])
         # Volume is the allowed time difference window, multiplied by 2pi for
         # each phase difference dimension and by allowed range of SNR ratio
         # for each SNR ratio dimension : there are (n_ifos - 1) dimensions
         # for both phase and SNR
-        n_ifos = len(self.hist_ifos)
+        n_ifos = len(self.model_ifos)
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srmax - self.srmin)) ** \
             (n_ifos - 1)
@@ -1528,12 +1564,12 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # coincs
         # Extent of time-difference space occupied
         noise_twindow = coinc_rate.multiifo_noise_coincident_area(
-                            self.hist_ifos, kwargs['time_addition'])
+                            self.model_ifos, kwargs['time_addition'])
         # Volume is the allowed time difference window, multiplied by 2pi for
         # each phase difference dimension and by allowed range of SNR ratio
         # for each SNR ratio dimension : there are (n_ifos - 1) dimensions
         # for both phase and SNR
-        n_ifos = len(self.hist_ifos)
+        n_ifos = len(self.model_ifos)
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srmax - self.srmin)) ** \
             (n_ifos - 1)

@@ -1,7 +1,7 @@
 import numpy as np
 cimport numpy as cnp
 from cython import wraparound, boundscheck, cdivision
-from libc.math cimport M_PI, sqrt
+from libc.math cimport M_PI, sqrt, log
 from libc.math cimport round as cround
 
 
@@ -39,9 +39,6 @@ def logsignalrateinternals_computepsignalbins(
     double[:] pdif,
     double[:] tdif,
     double[:] sdif,
-    int[:] pbin,
-    int[:] tbin,
-    int[:] sbin,
     float[:] p,
     double[:] t,
     float[:] s,
@@ -53,9 +50,6 @@ def logsignalrateinternals_computepsignalbins(
     double[:] shift,
     double sense,
     double senseref,
-    double twidth,
-    double pwidth,
-    double swidth,
     int to_shift_ref,
     int to_shift_ifo,
     int length
@@ -69,12 +63,9 @@ def logsignalrateinternals_computepsignalbins(
             # C modulus operator is not same as python's, correct for this
             pdif[idx] += (M_PI * 2)
         tdif[idx] = shift[idx] * to_shift_ref + tref[idx] - shift[idx] * to_shift_ifo - t[idx]
-        sdif[idx] = (s[idx] * sense * sqrt(sigref[ridx])) / (sref[idx] * senseref * sqrt(sig[idx]))
+        sdif[idx] = log((s[idx] * sense * sqrt(sigref[idx])) / (sref[idx] * senseref * sqrt(sig[idx])))
 
-    for idx in range(length):
-        tbin[idx] = tdif[idx]
-        pbin[idx] = pdif[idx]
-        sbin[idx] = numpy.log(sdif[idx])
+
 
 
 @boundscheck(False)

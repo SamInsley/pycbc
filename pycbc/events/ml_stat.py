@@ -34,7 +34,7 @@ class MLModel:
 class DataTransform:
     """Data transformation to map data to [0, 1]^d"""
 
-    def __init__(self, bounds: np.ndarray, device: str | torch.device):
+    def __init__(self, bounds: np.ndarray, device):
         self.bounds = torch.from_numpy(bounds).to(device)
         self.device = device
         self.log_abs_det_jacobian = -torch.log(
