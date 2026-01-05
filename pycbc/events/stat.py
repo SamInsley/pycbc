@@ -341,9 +341,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.model_ifos = None
         self.ref_snr = 5.
         self.relsense = {}
-        self.srmax = 5.
-        self.srmin = .2
-        self.hist_max = 300. 
+        self.srmax = self.srmin = None
+        self.hist_max = None
+        
         # Some memory
         self.pdif = numpy.zeros(128, dtype=numpy.float64)
         self.tdif = numpy.zeros(128, dtype=numpy.float64)
@@ -352,20 +352,8 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.pbin = numpy.zeros(128, dtype=numpy.int32)
         self.sbin = numpy.zeros(128, dtype=numpy.int32)
 
-        # Is the histogram needed to be pre-generated?
-        hist_needed = pregenerate_hist
-        hist_needed &= not len(ifos) == 1
-        #hist_needed &= (type(self).__name__ == "PhaseTD" or self.kwargs["phasetd"])
-
-        if hist_needed:
+        if pregenerate_hist and not len(ifos) == 1:
             self.get_hist()
-        elif len(ifos) == 1:
-            # remove all phasetd files from self.files and self.file_hashes,
-            # as they are not needed
-            for k in list(self.files.keys()):
-                if 'phasetd_newsnr' in k:
-                    del self.files[k]
-                    del self.file_hashes[k]
 
     def get_hist(self, ifos=None):
         """
@@ -395,13 +383,6 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 selected = name
                 break
 
-        # If there are other phasetd_newsnr files, they aren't needed.
-        # So tidy them out of the self.files dictionary
-        rejected = [key for key in self.files.keys()
-                    if 'phasetd_newsnr' in key and not key == selected]
-        for k in rejected:
-            del self.files[k]
-            del self.file_hashes[k]
 
         if selected is None and len(ifos) > 1:
             raise RuntimeError("Couldn't figure out which stat file to use")
@@ -415,35 +396,15 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.model = MLStatistic.from_file(self.files[selected], group_name="model")
         self.model_ifos = self.model.metadata.get("ifos")
         self.model_relfac = self.model.metadata.get("relfac")
+        self.srmax = self.model.metadata.get("smax")
+        self.srmin = self.model.metadata.get("smin")
+        self.hist_max = self.model.metadata.get("hist_max")
 
         for ifo, sense in zip(self.model_ifos, self.model_relfac):
             self.relsense[ifo] = sense
         
         self.has_hist = True
 
-    def update_file(self, key):
-        """
-        Update file used in this statistic.
-        If others are used (i.e. this statistic is inherited), they will
-        need updated separately
-        """
-        if 'phasetd_newsnr' in key and not len(self.ifos) == 1:
-            if ''.join(sorted(self.ifos)) not in key:
-                logger.debug(
-                    "%s file is not used for %s statistic",
-                    key,
-                    ''.join(self.ifos)
-                )
-                return False
-            logger.info(
-                "Updating %s statistic %s file",
-                ''.join(self.ifos),
-                key
-            )
-            # This is a PhaseTDStatistic file which needs updating
-            self.get_hist()
-            return True
-        return False
 
     def logsignalrate(self, stats, shift, to_shift):
         """
@@ -492,11 +453,11 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             senseref = self.relsense[self.model_ifos[0]]
 
             binned = []
-            other_ifos = [ifo for ifo in self.ifos if ifo != ref_ifo]
+            other_ifos = [ifo for ifo in self.model_ifos if ifo != ref_ifo]
             for ifo in other_ifos:
                 # Assign cached memory
                 length = len(pref)
-                while length > len(pref):
+                while length > len(self.pdif):
                     newlen = len(self.pdif) * 2
                     self.pdif = numpy.zeros(newlen, dtype=numpy.float64)
                     self.tdif = numpy.zeros(newlen, dtype=numpy.float64)
@@ -525,19 +486,20 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     to_shift[ifo],
                     length,
                 )
-
+                
                 binned += [
-                    self.tdif[:length],
-                    self.pdif[:length],
-                    self.sdif[:length],
+                    self.tdif[:length].copy(),
+                    self.pdif[:length].copy(),
+                    self.sdif[:length].copy(),
                 ]
-
             # Read signal weight from precalculated histogram
-            x = numpy.column_stack(binned).astype(numpy.float32)
+            
+            x = numpy.column_stack(binned)
             snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
             smin = snrs.min(axis=0)
             rate = self.model.log_prob(x)
             rate += numpy.log((smin / self.ref_snr) ** -4.)
+            
 
         return rate
 
