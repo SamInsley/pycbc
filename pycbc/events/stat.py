@@ -1582,6 +1582,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srbmax - self.srbmin) * self.swidth) ** \
             (n_ifos - 1)
+        print(hist_vol)
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
@@ -1668,6 +1669,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srbmax - self.srbmin) * self.swidth) ** \
             (n_ifos - 1)
+        print(hist_vol)
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
