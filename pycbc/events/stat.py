@@ -1582,11 +1582,11 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srbmax - self.srbmin) * self.swidth) ** \
             (n_ifos - 1)
-        print(hist_vol)
+        
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
-
+        print(logr_s, logr_n)
         # Combine to get final statistic: log of
         # ((rate of signals / rate of noise) * PTA Bayes factor)
         loglr = network_logvol - ln_noise_rate + logr_s - logr_n
@@ -1669,11 +1669,11 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srbmax - self.srbmin) * self.swidth) ** \
             (n_ifos - 1)
-        print(hist_vol)
+        
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
-
+        print(logr_s, logr_n)
         loglr = - thresh + network_logvol - ln_noise_rate + logr_s - logr_n
         loglr += self.stat_correction
         return loglr
