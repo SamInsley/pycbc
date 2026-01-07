@@ -445,7 +445,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             # min entry by design, so use the min of the last one read in.
             self.max_penalty = self.weights[ifo].min()
             self.hist_max = max(self.hist_max, self.weights[ifo].max())
-            print(self.hist_max)
+        
             if self.two_det_flag:
                 # The density of signals is computed as a function of 3 binned
                 # parameters: time difference (t), phase difference (p) and
@@ -1656,7 +1656,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Assume best case scenario and use maximum signal rate
         logr_s = numpy.log(self.hist_max
                            * (kwargs['min_snr'] / self.ref_snr) ** -4.)
-       
+        print(logr_s)
         # Find total volume of phase-time-amplitude space occupied by noise
         # coincs
         # Extent of time-difference space occupied
