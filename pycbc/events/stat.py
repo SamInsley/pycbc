@@ -1717,7 +1717,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
     
         # Combine to get final statistic: log of
         # ((rate of signals / rate of noise) * PTA Bayes factor)
-        loglr = network_logvol - ln_noise_rate + logr_s 
+        loglr = network_logvol - ln_noise_rate + logr_s - logr_n
 
         loglr += self.stat_correction
         
@@ -1784,7 +1784,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Assume best case scenario and use maximum signal rate
         logr_s = numpy.log(self.hist_max
                            * (kwargs['min_snr'] / self.ref_snr) ** -4.)
-        print(logr_s)
+        
         # Find total volume of phase-time-amplitude space occupied by noise
         # coincs
         # Extent of time-difference space occupied
@@ -1803,7 +1803,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # coincs
         logr_n = - numpy.log(hist_vol)
         
-        loglr = - thresh + network_logvol - ln_noise_rate + logr_s 
+        loglr = - thresh + network_logvol - ln_noise_rate + logr_s - logr_n
 
         loglr += self.stat_correction
         return loglr
