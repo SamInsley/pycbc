@@ -1656,7 +1656,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Assume best case scenario and use maximum signal rate
         logr_s = numpy.log(self.hist_max
                            * (kwargs['min_snr'] / self.ref_snr) ** -4.)
-
+        print(logr_s, self.hist_max, kwargs['min_snr'], self.ref_snr)
         # Find total volume of phase-time-amplitude space occupied by noise
         # coincs
         # Extent of time-difference space occupied
