@@ -546,6 +546,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             sref = ss[ref_ifo]
             sigref = sigs[ref_ifo]
             senseref = self.relsense[self.hist_ifos[0]]
+            
 
             binned = []
             other_ifos = [ifo for ifo in self.ifos if ifo != ref_ifo]
@@ -1585,12 +1586,12 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
-        print(logr_n, noise_twindow, self.srbmax, self.srbmin, self.swidth, n_ifos)
+        
         # Combine to get final statistic: log of
         # ((rate of signals / rate of noise) * PTA Bayes factor)
         loglr = network_logvol - ln_noise_rate + logr_s - logr_n
         loglr += self.stat_correction
-
+        print(network_logvol, ln_noise_rate)
         # cut off underflowing and very small values
         loglr[loglr < -30.] = -30.
         return loglr
@@ -1671,8 +1672,8 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
-        print(logr_n, noise_twindow, self.srbmax, self.srbmin, self.swidth, n_ifos)
         loglr = - thresh + network_logvol - ln_noise_rate + logr_s - logr_n
+        print(thresh, network_logvol, ln_noise_rate)
         loglr += self.stat_correction
         return loglr
 
