@@ -672,7 +672,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 self.ref_snr,
                 length
             )
-
+            snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
+            smin = snrs.min(axis=0)
+            rate *= (smin / self.ref_snr) ** -4.
             return numpy.log(rate)
 
         # ------------------------------------------------------------
@@ -1782,7 +1784,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Assume best case scenario and use maximum signal rate
         logr_s = numpy.log(self.hist_max
                            * (kwargs['min_snr'] / self.ref_snr) ** -4.)
-
+        print(logr_s)
         # Find total volume of phase-time-amplitude space occupied by noise
         # coincs
         # Extent of time-difference space occupied

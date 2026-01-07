@@ -161,9 +161,7 @@ def logsignalrateinternals_compute2detrate(
             rate[ridx] = two_det_weights[id0, id1, id2]
         else:
             rate[ridx] = max_penalty
-        # Scale by signal population SNR
-        rescale_fac = ref_snr / sref[ridx]
-        rate[ridx] *= (rescale_fac*rescale_fac*rescale_fac*rescale_fac)
+        
 
 
 @boundscheck(False)
