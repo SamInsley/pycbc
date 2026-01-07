@@ -31,6 +31,7 @@ import h5py
 from . import ranking
 from . import coinc_rate
 from .eventmgr_cython import logsignalrateinternals_computepsignalbins
+from .eventmgr_cython import logsignalrateinternals_computepsignalbins_2det
 from .eventmgr_cython import logsignalrateinternals_compute2detrate
 
 logger = logging.getLogger('pycbc.events.stat')
@@ -404,10 +405,14 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             self.srbmin = histfile.attrs['srbmin']
             self.srbmax = histfile.attrs['srbmax']
             relfac = histfile.attrs['sensitivity_ratios']
-
-            for ifo in self.hist_ifos:
-                weights[ifo] = histfile[ifo]['weights'][:]
-                param[ifo] = histfile[ifo]['param_bin'][:]
+            
+            if self.two_det_flag:
+                weights[self.hist_ifos[0]] = histfile[self.hist_ifos[0]]['weights'][:]
+                param[self.hist_ifos[0]] = histfile[self.hist_ifos[0]]['param_bin'][:]
+            else:
+                for ifo in self.hist_ifos:
+                    weights[ifo] = histfile[ifo]['weights'][:]
+                    param[ifo] = histfile[ifo]['param_bin'][:]
 
         n_ifos = len(self.hist_ifos)
 
@@ -416,7 +421,8 @@ class PhaseTDStatistic(QuadratureSumStatistic):
 
         # Read histogram for each ifo, to use if that ifo has smallest SNR in
         # the coinc
-        for ifo in self.hist_ifos:
+        if self.two_det_flag:
+            ifo = self.hist_ifos[0]
 
             # renormalise to PDF
             self.weights[ifo] = \
@@ -427,7 +433,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 ncol = param[ifo].shape[1]
                 self.pdtype = [('c%s' % i, param[ifo].dtype) for i in range(ncol)]
                 self.param_bin[ifo] = numpy.zeros(len(self.weights[ifo]),
-                                                  dtype=self.pdtype)
+                                                dtype=self.pdtype)
                 for i in range(ncol):
                     self.param_bin[ifo]['c%s' % i] = param[ifo][:, i]
 
@@ -478,7 +484,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 )
 
                 array_size = [self.c0_size[ifo], self.c1_size[ifo],
-                              self.c2_size[ifo]]
+                            self.c2_size[ifo]]
                 dtypec = self.weights[ifo].dtype
                 self.two_det_weights[ifo] = \
                     numpy.zeros(array_size, dtype=dtypec) + self.max_penalty
@@ -489,6 +495,80 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 id2 = self.param_bin[ifo]['c2'].astype(numpy.int32) \
                     + self.c2_size[ifo] // 2
                 self.two_det_weights[ifo][id0, id1, id2] = self.weights[ifo]
+        else:
+            for ifo in self.hist_ifos:
+
+                # renormalise to PDF
+                self.weights[ifo] = \
+                    weights[ifo] / (weights[ifo].sum() * bin_volume)
+
+                if param[ifo].dtype == numpy.int8:
+                    # Older style, incorrectly sorted histogram file
+                    ncol = param[ifo].shape[1]
+                    self.pdtype = [('c%s' % i, param[ifo].dtype) for i in range(ncol)]
+                    self.param_bin[ifo] = numpy.zeros(len(self.weights[ifo]),
+                                                    dtype=self.pdtype)
+                    for i in range(ncol):
+                        self.param_bin[ifo]['c%s' % i] = param[ifo][:, i]
+
+                    lsort = self.param_bin[ifo].argsort()
+                    self.param_bin[ifo] = self.param_bin[ifo][lsort]
+                    self.weights[ifo] = self.weights[ifo][lsort]
+                else:
+                    # New style, efficient histogram file
+                    # param bin and weights have already been sorted
+                    self.param_bin[ifo] = param[ifo]
+                    self.pdtype = self.param_bin[ifo].dtype
+
+                # Max_penalty is a small number to assigned to any bins without
+                # histogram entries. All histograms in a given file have the same
+                # min entry by design, so use the min of the last one read in.
+                self.max_penalty = self.weights[ifo].min()
+                self.hist_max = max(self.hist_max, self.weights[ifo].max())
+
+                if self.two_det_flag:
+                    # The density of signals is computed as a function of 3 binned
+                    # parameters: time difference (t), phase difference (p) and
+                    # SNR ratio (s). These are computed for each combination of
+                    # detectors, so for detectors 6 differences are needed. However
+                    # many combinations of these parameters are highly unlikely and
+                    # no instances of these combinations occurred when generating
+                    # the statistic files. Rather than storing a bunch of 0s, these
+                    # values are just not stored at all. This reduces the size of
+                    # the statistic file, but means we have to identify the correct
+                    # value to read for every trigger. For 2 detectors we can
+                    # expand the weights lookup table here, basically adding in all
+                    # the "0" values. This makes looking up a value in the
+                    # "weights" table a O(N) rather than O(NlogN) operation. It
+                    # sacrifices RAM to do this, so is a good tradeoff for 2
+                    # detectors, but not for 3!
+                    if not hasattr(self, 'c0_size'):
+                        self.c0_size = {}
+                        self.c1_size = {}
+                        self.c2_size = {}
+
+                    self.c0_size[ifo] = numpy.int32(
+                        2 * (abs(self.param_bin[ifo]['c0']).max() + 1)
+                    )
+                    self.c1_size[ifo] = numpy.int32(
+                        2 * (abs(self.param_bin[ifo]['c1']).max() + 1)
+                    )
+                    self.c2_size[ifo] = numpy.int32(
+                        2 * (abs(self.param_bin[ifo]['c2']).max() + 1)
+                    )
+
+                    array_size = [self.c0_size[ifo], self.c1_size[ifo],
+                                self.c2_size[ifo]]
+                    dtypec = self.weights[ifo].dtype
+                    self.two_det_weights[ifo] = \
+                        numpy.zeros(array_size, dtype=dtypec) + self.max_penalty
+                    id0 = self.param_bin[ifo]['c0'].astype(numpy.int32) \
+                        + self.c0_size[ifo] // 2
+                    id1 = self.param_bin[ifo]['c1'].astype(numpy.int32) \
+                        + self.c1_size[ifo] // 2
+                    id2 = self.param_bin[ifo]['c2'].astype(numpy.int32) \
+                        + self.c2_size[ifo] // 2
+                    self.two_det_weights[ifo][id0, id1, id2] = self.weights[ifo]
 
         for ifo, sense in zip(self.hist_ifos, relfac):
             self.relsense[ifo] = sense
@@ -498,21 +578,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
     def logsignalrate(self, stats, shift, to_shift):
         """
         Calculate the normalized log rate density of signals via lookup
-
-        Parameters
-        ----------
-        stats: dict of dicts
-            Single-detector quantities for each detector
-        shift: numpy array of float
-            Time shift vector for each coinc to be ranked
-        to_shift: list of ints
-            Multiple of the time shift to apply, ordered as self.ifos
-
-        Returns
-        -------
-        value: log of coinc signal rate density for the given single-ifo
-            triggers and time shifts
         """
+        import numpy
+
         # Convert time shift vector to dict, as hist ifos and self.ifos may
         # not be in same order
         to_shift = {ifo: s for ifo, s in zip(self.ifos, to_shift)}
@@ -520,25 +588,107 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         if not self.has_hist:
             self.get_hist()
 
+        # Common cached arrays
+        rate = numpy.zeros(len(shift), dtype=numpy.float32)
+        ps = {ifo: numpy.array(stats[ifo]['coa_phase'], ndmin=1) for ifo in self.ifos}
+        ts = {ifo: numpy.array(stats[ifo]['end_time'], ndmin=1) for ifo in self.ifos}
+        ss = {ifo: numpy.array(stats[ifo]['snr'], ndmin=1) for ifo in self.ifos}
+        sigs = {ifo: numpy.array(stats[ifo]['sigmasq'], ndmin=1) for ifo in self.ifos}
+
+        # ------------------------------------------------------------
+        # Two-det: no per-trigger reference selection, just use hist_ifos[0]
+        # ------------------------------------------------------------
+        if self.two_det_flag:
+            ref_ifo = self.hist_ifos[0]
+            other_ifos = [ifo for ifo in self.ifos if ifo != ref_ifo]
+            if len(other_ifos) != 1:
+                raise ValueError(
+                    f"two_det_flag=True but expected exactly 2 ifos; got {self.ifos}"
+                )
+            ifo = other_ifos[0]
+
+            # All triggers use the same reference
+            rtype = numpy.arange(len(shift), dtype=numpy.int64)
+
+            pref = ps[ref_ifo]
+            tref = ts[ref_ifo]
+            sref = ss[ref_ifo]
+            sigref = sigs[ref_ifo]
+            senseref = self.relsense[ref_ifo]
+
+            length = len(rtype)
+
+            # Ensure cached memory is large enough
+            while length > len(self.pdif):
+                newlen = len(self.pdif) * 2
+                self.pdif = numpy.zeros(newlen, dtype=numpy.float64)
+                self.tdif = numpy.zeros(newlen, dtype=numpy.float64)
+                self.sdif = numpy.zeros(newlen, dtype=numpy.float64)
+                self.pbin = numpy.zeros(newlen, dtype=numpy.int32)
+                self.tbin = numpy.zeros(newlen, dtype=numpy.int32)
+                self.sbin = numpy.zeros(newlen, dtype=numpy.int32)
+
+            # Bin (time, phase, snr-related) differences for the *other* ifo vs ref_ifo
+            logsignalrateinternals_computepsignalbins_2det(
+                self.pdif,
+                self.tdif,
+                self.sdif,
+                self.pbin,
+                self.tbin,
+                self.sbin,
+                ps[ifo],
+                ts[ifo],
+                ss[ifo],
+                sigs[ifo],
+                pref,
+                tref,
+                sref,
+                sigref,
+                shift,
+                rtype,
+                self.relsense[ifo],
+                senseref,
+                self.twidth,
+                self.pwidth,
+                self.swidth,
+                to_shift[ref_ifo],
+                to_shift[ifo],
+                length
+            )
+
+            # Read signal weight from precalculated histogram (two-det fast path)
+            logsignalrateinternals_compute2detrate(
+                self.tbin[:length],
+                self.pbin[:length],
+                self.sbin[:length],
+                self.c0_size[ref_ifo],
+                self.c1_size[ref_ifo],
+                self.c2_size[ref_ifo],
+                rate,
+                rtype,
+                sref,
+                self.two_det_weights[ref_ifo],
+                self.max_penalty,
+                self.ref_snr,
+                length
+            )
+
+            return numpy.log(rate)
+
+        # ------------------------------------------------------------
+        # Three-det (or >2 det): unchanged logic (reference = min SNR per trigger)
+        # ------------------------------------------------------------
+
         # Figure out which ifo of the contributing ifos has the smallest SNR,
         # to use as reference for choosing the signal histogram.
         snrs = numpy.array([numpy.array(stats[ifo]['snr'], ndmin=1)
-                           for ifo in self.ifos])
+                            for ifo in self.ifos])
         smin = snrs.argmin(axis=0)
+
         # Store a list of the triggers using each ifo as reference
         rtypes = {ifo: numpy.where(smin == j)[0]
-                  for j, ifo in enumerate(self.ifos)}
+                for j, ifo in enumerate(self.ifos)}
 
-        # Get reference ifo information
-        rate = numpy.zeros(len(shift), dtype=numpy.float32)
-        ps = {ifo: numpy.array(stats[ifo]['coa_phase'], ndmin=1)
-              for ifo in self.ifos}
-        ts = {ifo: numpy.array(stats[ifo]['end_time'], ndmin=1)
-              for ifo in self.ifos}
-        ss = {ifo: numpy.array(stats[ifo]['snr'], ndmin=1)
-              for ifo in self.ifos}
-        sigs = {ifo: numpy.array(stats[ifo]['sigmasq'], ndmin=1)
-                for ifo in self.ifos}
         for ref_ifo in self.ifos:
             rtype = rtypes[ref_ifo]
             pref = ps[ref_ifo]
@@ -550,8 +700,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             binned = []
             other_ifos = [ifo for ifo in self.ifos if ifo != ref_ifo]
             for ifo in other_ifos:
-                # Assign cached memory
                 length = len(rtype)
+
+                # Assign cached memory
                 while length > len(self.pdif):
                     newlen = len(self.pdif) * 2
                     self.pdif = numpy.zeros(newlen, dtype=numpy.float64)
@@ -595,44 +746,19 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     self.sbin[:length]
                 ]
 
-            # Read signal weight from precalculated histogram
-            if self.two_det_flag:
-                # High-RAM, low-CPU option for two-det
-                logsignalrateinternals_compute2detrate(
-                    binned[0],
-                    binned[1],
-                    binned[2],
-                    self.c0_size[ref_ifo],
-                    self.c1_size[ref_ifo],
-                    self.c2_size[ref_ifo],
-                    rate,
-                    rtype,
-                    sref,
-                    self.two_det_weights[ref_ifo],
-                    self.max_penalty,
-                    self.ref_snr,
-                    len(rtype)
-                )
-            else:
-                # Low[er]-RAM, high[er]-CPU option for >two det
+            # Low[er]-RAM, high[er]-CPU option for >two det (unchanged)
+            nbinned = numpy.zeros(len(binned[1]), dtype=self.pdtype)
+            for i, b in enumerate(binned):
+                nbinned[f'c{i}'] = b
 
-                # Convert binned to same dtype as stored in hist
-                nbinned = numpy.zeros(len(binned[1]), dtype=self.pdtype)
-                for i, b in enumerate(binned):
-                    nbinned[f'c{i}'] = b
+            loc = numpy.searchsorted(self.param_bin[ref_ifo], nbinned)
+            loc[loc == len(self.weights[ref_ifo])] = 0
+            rate[rtype] = self.weights[ref_ifo][loc]
 
-                loc = numpy.searchsorted(self.param_bin[ref_ifo], nbinned)
-                loc[loc == len(self.weights[ref_ifo])] = 0
-                rate[rtype] = self.weights[ref_ifo][loc]
+            missed = numpy.where(self.param_bin[ref_ifo][loc] != nbinned)[0]
+            rate[rtype[missed]] = self.max_penalty
 
-                # These weren't in our histogram so give them max penalty
-                # instead of random value
-                missed = numpy.where(
-                    self.param_bin[ref_ifo][loc] != nbinned
-                )[0]
-                rate[rtype[missed]] = self.max_penalty
-                # Scale by signal population SNR
-                rate[rtype] *= (sref[rtype] / self.ref_snr) ** -4.
+            rate[rtype] *= (sref[rtype] / self.ref_snr) ** -4.
 
         return numpy.log(rate)
 
@@ -1586,7 +1712,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
-        print(logr_s, logr_n)
+        print(logr_n, noise_twindow, self.srbmax, self.srbmin, self.swidth, n_ifos)
         # Combine to get final statistic: log of
         # ((rate of signals / rate of noise) * PTA Bayes factor)
         loglr = network_logvol - ln_noise_rate + logr_s - logr_n
@@ -1669,11 +1795,11 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         hist_vol = noise_twindow * \
             (2. * numpy.pi * (self.srbmax - self.srbmin) * self.swidth) ** \
             (n_ifos - 1)
-        
+        print(logr_n, noise_twindow, self.srbmax, self.srbmin, self.swidth, n_ifos)
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
-        print(logr_s, logr_n)
+        
         loglr = - thresh + network_logvol - ln_noise_rate + logr_s - logr_n
         loglr += self.stat_correction
         return loglr

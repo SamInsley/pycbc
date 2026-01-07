@@ -1,7 +1,7 @@
 import numpy as np
 cimport numpy as cnp
 from cython import wraparound, boundscheck, cdivision
-from libc.math cimport M_PI, sqrt
+from libc.math cimport M_PI, sqrt, log
 from libc.math cimport round as cround
 
 
@@ -72,6 +72,52 @@ def logsignalrateinternals_computepsignalbins(
             pdif[idx] += (M_PI * 2)
         tdif[idx] = shift[ridx] * to_shift_ref + tref[ridx] - shift[ridx] * to_shift_ifo - t[ridx]
         sdif[idx] = (s[ridx] * sense * sqrt(sigref[ridx])) / (sref[ridx] * senseref * sqrt(sig[ridx]))
+
+    for idx in range(length):
+        tbin[idx] = <int>(tdif[idx] / twidth)
+        pbin[idx] = <int>(pdif[idx] / pwidth)
+        sbin[idx] = <int>(sdif[idx] / swidth)
+
+@boundscheck(False)
+@wraparound(False)
+@cdivision(True)
+def logsignalrateinternals_computepsignalbins_2det(
+    double[:] pdif,
+    double[:] tdif,
+    double[:] sdif,
+    int[:] pbin,
+    int[:] tbin,
+    int[:] sbin,
+    float[:] p,
+    double[:] t,
+    float[:] s,
+    float[:] sig,
+    float[:] pref,
+    double[:] tref,
+    float[:] sref,
+    float[:] sigref,
+    double[:] shift,
+    long int[:] rtype,
+    double sense,
+    double senseref,
+    double twidth,
+    double pwidth,
+    double swidth,
+    int to_shift_ref,
+    int to_shift_ifo,
+    int length
+):
+    cdef:
+        int idx, ridx
+
+    for idx in range(length):
+        ridx = rtype[idx]
+        pdif[idx] = (pref[ridx] - p[ridx]) % (M_PI * 2)
+        if pdif[idx] < 0:
+            # C modulus operator is not same as python's, correct for this
+            pdif[idx] += (M_PI * 2)
+        tdif[idx] = shift[ridx] * to_shift_ref + tref[ridx] - shift[ridx] * to_shift_ifo - t[ridx]
+        sdif[idx] = log(s[ridx] * sense * sqrt(sigref[ridx])) / (sref[ridx] * senseref * sqrt(sig[ridx]))
 
     for idx in range(length):
         tbin[idx] = <int>(tdif[idx] / twidth)
