@@ -63,7 +63,8 @@ def logsignalrateinternals_computepsignalbins(
             # C modulus operator is not same as python's, correct for this
             pdif[idx] += (M_PI * 2)
         tdif[idx] = shift[idx] * to_shift_ref + tref[idx] - shift[idx] * to_shift_ifo - t[idx]
-        sdif[idx] = log((s[idx] * sense * sqrt(sigref[idx])) / (sref[idx] * senseref * sqrt(sig[idx])))
+        sdif[idx] = log(s[idx] * sense * sqrt(sigref[idx])) / (sref[idx] * senseref * sqrt(sig[idx]))
+        
 
 
 
