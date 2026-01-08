@@ -674,6 +674,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             )
             snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
             smin = snrs.min(axis=0)
+            
             rate *= (smin / self.ref_snr) ** -4.
             return numpy.log(rate)
 

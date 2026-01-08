@@ -162,6 +162,7 @@ def logsignalrateinternals_compute2detrate(
         else:
             rate[ridx] = max_penalty
         
+        
 
 
 @boundscheck(False)
