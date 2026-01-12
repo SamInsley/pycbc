@@ -451,7 +451,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             # min entry by design, so use the min of the last one read in.
             self.max_penalty = self.weights[ifo].min()
             self.hist_max = max(self.hist_max, self.weights[ifo].max())
-
+            print(self.hist_max)
             if self.two_det_flag:
                 # The density of signals is computed as a function of 3 binned
                 # parameters: time difference (t), phase difference (p) and
@@ -525,6 +525,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 # min entry by design, so use the min of the last one read in.
                 self.max_penalty = self.weights[ifo].min()
                 self.hist_max = max(self.hist_max, self.weights[ifo].max())
+                
 
                 if self.two_det_flag:
                     # The density of signals is computed as a function of 3 binned
@@ -615,7 +616,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             sref = ss[ref_ifo]
             sigref = sigs[ref_ifo]
             senseref = self.relsense[ref_ifo]
-
+            
             length = len(rtype)
 
             # Ensure cached memory is large enough
@@ -676,7 +677,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             smin = snrs.min(axis=0)
             
             rate *= (smin / self.ref_snr) ** -4.
-            return numpy.log(rate)
+            log_rate = numpy.log(rate)
+            log_rate -= self.sdif[:length]
+            return log_rate
 
         # ------------------------------------------------------------
         # Three-det (or >2 det): unchanged logic (reference = min SNR per trigger)
