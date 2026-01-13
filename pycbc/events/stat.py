@@ -498,7 +498,8 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
             smin = snrs.min(axis=0)
             rate = self.model.log_prob(x)
-            rate -= (self.sdif[:length])
+            sdif_sum = x[:, 2::3].sum(axis=1)   # shape (length,)
+            rate -= sdif_sum
             rate += numpy.log((smin / self.ref_snr) ** -4.)
             
 
