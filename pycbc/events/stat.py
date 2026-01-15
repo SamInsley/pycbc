@@ -451,7 +451,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             # min entry by design, so use the min of the last one read in.
             self.max_penalty = self.weights[ifo].min()
             self.hist_max = max(self.hist_max, self.weights[ifo].max())
-            print(self.hist_max)
+            
             if self.two_det_flag:
                 # The density of signals is computed as a function of 3 binned
                 # parameters: time difference (t), phase difference (p) and
