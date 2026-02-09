@@ -47,7 +47,7 @@ install_requires = setup_requires + [
     'tqdm',
     'setuptools<82.0.0',
     'gwdatafind',
-    'pegasus-wms.api >= 5.0.6',
+    'pegasus-wms.api == 5.1.2',
     'python-ligo-lw >= 1.7.0',
     'ligo-segments',
     'lalsuite!=7.2,<7.25',
@@ -119,7 +119,7 @@ def get_version_info():
         vinfo = _version_helper.generate_git_version_info()
     except:
         vinfo = vdummy()
-        vinfo.version = '2.3.14'
+        vinfo.version = '2.3.15'
         vinfo.release = True
 
     version_script = f"""# coding: utf-8
