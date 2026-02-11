@@ -342,6 +342,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.ref_snr = 5.
         self.relsense = {}
         self.srmax = self.srmin = None
+        self.snrmax = self.snrmin = None
         self.hist_max = None
         
         # Some memory
@@ -396,8 +397,6 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.model = MLStatistic.from_file(self.files[selected], group_name="model")
         self.model_ifos = self.model.metadata.get("ifos")
         self.model_relfac = self.model.metadata.get("relfac")
-        self.srmax = self.model.metadata.get("smax")
-        self.srmin = self.model.metadata.get("smin")
         self.hist_max = self.model.metadata.get("hist_max")
 
         for ifo, sense in zip(self.model_ifos, self.model_relfac):
@@ -451,7 +450,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             sref = ss[ref_ifo]
             sigref = sigs[ref_ifo]
             senseref = self.relsense[self.model_ifos[0]]
-
+            snr_ref = stats[ref_ifo]["snr"]
             binned = []
             other_ifos = [ifo for ifo in self.model_ifos if ifo != ref_ifo]
             for ifo in other_ifos:
@@ -462,9 +461,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     self.pdif = numpy.zeros(newlen, dtype=numpy.float64)
                     self.tdif = numpy.zeros(newlen, dtype=numpy.float64)
                     self.sdif = numpy.zeros(newlen, dtype=numpy.float64)
-                    self.pbin = numpy.zeros(newlen, dtype=numpy.int32)
-                    self.tbin = numpy.zeros(newlen, dtype=numpy.int32)
-                    self.sbin = numpy.zeros(newlen, dtype=numpy.int32)
+                    
 
                 # Calculate differences
                 logsignalrateinternals_computepsignalbins(
@@ -493,14 +490,15 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                     self.sdif[:length].copy(),
                 ]
             # Read signal weight from precalculated histogram
-            
+            n_ifos = len(self.model_ifos)
+            binned.append(numpy.log(snr_ref))
             x = numpy.column_stack(binned)
-            snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
-            smin = snrs.min(axis=0)
             rate = self.model.log_prob(x)
-            sdif_sum = x[:, 2::3].sum(axis=1)   # shape (length,)
+            log_snr_ref = x[:, -1] 
+            rate -= (n_ifos * log_snr_ref)
+            sdif_sum = x[:, 2::3].sum(axis=1)  
             rate -= sdif_sum
-            rate += numpy.log((smin / self.ref_snr) ** -4.)
+            
             
 
         return rate
@@ -1272,6 +1270,39 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         self.curr_tnum = None
 
         self.stat_correction = float(statistic_correction)
+        self.sngl_hist = None
+        self.has_sngl_hist = False
+        # only makes sense if we might ever be asked to score singles
+        self.get_sngl_hist()
+
+    def get_sngl_hist(self, ifos=None):
+        """Load a 1D SNR signal model for single-ifo scoring if provided."""
+        selected = None
+        ifos = ifos or self.ifos
+        print(ifos)
+        for name in self.files:
+            if "phasetd_newsnr" in name:
+                ifokey = name.split("_")[2]
+                num = len(ifokey) / 2
+                if num != len(ifos):
+                    continue
+
+                match = [ifo in ifokey for ifo in ifos]
+                if False in match:
+                    continue
+                selected = name
+                break
+        if selected is None:
+            logger.info("No single-ifo SNR signal model provided")
+            self.has_sngl_hist = False
+            self.sngl_hist = None
+            return
+        logger.info("Using single-ifo SNR signal model %s", self.files[selected])
+        self.sngl_hist = MLStatistic.from_file(self.files[selected], group_name="model")
+        self.sngl_ifos = self.sngl_hist.metadata.get("ifos")
+        self.sngl_relfac = self.sngl_hist.metadata.get("relfac")
+        # you can store rhomin/rhomax etc in metadata if you want
+        self.get_sngl_hist = True    
 
     def assign_median_sigma(self, ifo):
         """
@@ -1386,7 +1417,22 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         network_logvol = 1.5 * numpy.log(network_sigmasq)
         benchmark_logvol = sngls['benchmark_logvol']
         network_logvol -= benchmark_logvol
-        ln_s = -4 * numpy.log(sngls['snr'] / self.ref_snr)
+
+        if self.has_sngl_hist and self.sngl_hist is not None:
+            # Evaluate p(rho | S) from the 1D model
+            sngls_binned = []
+            sngls_snrs = numpy.log(sngls['snr'])
+            sngls_binned.append(sngls_snrs)
+            x = numpy.column_stack(sngls_binned)
+            ln_s = self.sngl_hist.log_prob(x)
+            ln_s -= x[:,-1]
+            print("check")
+            
+        else:
+            # Fallback to the current analytic prior-ish scaling
+            ln_s = -4 * numpy.log(sngls['snr'] / self.ref_snr)
+            print("Failing back to old prior")
+        
         loglr = network_logvol - ln_noise_rate + ln_s
         loglr += self.stat_correction
         # cut off underflowing and very small values
@@ -1423,6 +1469,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # determined by the least sensitive ifo
         network_sigmasq = numpy.amin([sngl[1]['sigmasq'] for sngl in s],
                                      axis=0)
+        print(self.model_ifos, network_sigmasq)
         # Volume \propto sigma^3 or sigmasq^1.5
         network_logvol = 1.5 * numpy.log(network_sigmasq)
         # Get benchmark log volume as single-ifo information :
@@ -1449,11 +1496,12 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # for both phase and SNR
         n_ifos = len(self.model_ifos)
         hist_vol = noise_twindow * \
-            (2. * numpy.pi * (self.srmax - self.srmin)) ** \
+            (2. * numpy.pi) ** \
             (n_ifos - 1)
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
         # coincs
         logr_n = - numpy.log(hist_vol)
+       
         
         # Combine to get final statistic: log of
         # ((rate of signals / rate of noise) * PTA Bayes factor)
@@ -1521,8 +1569,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         network_logvol -= benchmark_logvol
 
         # Assume best case scenario and use maximum signal rate
-        logr_s = numpy.log(self.hist_max
-                           * (kwargs['min_snr'] / self.ref_snr) ** -4.)
+        logr_s = numpy.log(self.hist_max)
 
         # Find total volume of phase-time-amplitude space occupied by noise
         # coincs
@@ -1534,8 +1581,9 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # for each SNR ratio dimension : there are (n_ifos - 1) dimensions
         # for both phase and SNR
         n_ifos = len(self.model_ifos)
+        
         hist_vol = noise_twindow * \
-            (2. * numpy.pi * (self.srmax - self.srmin)) ** \
+            (2. * numpy.pi) ** \
             (n_ifos - 1)
         
         # Noise PDF is 1/volume, assuming a uniform distribution of noise
