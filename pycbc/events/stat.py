@@ -1279,7 +1279,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         """Load a 1D SNR signal model for single-ifo scoring if provided."""
         selected = None
         ifos = ifos or self.ifos
-        print(ifos)
+        
         for name in self.files:
             if "phasetd_newsnr" in name:
                 ifokey = name.split("_")[2]
@@ -1302,7 +1302,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         self.sngl_ifos = self.sngl_hist.metadata.get("ifos")
         self.sngl_relfac = self.sngl_hist.metadata.get("relfac")
         # you can store rhomin/rhomax etc in metadata if you want
-        self.get_sngl_hist = True    
+        self.has_sngl_hist = True    
 
     def assign_median_sigma(self, ifo):
         """
@@ -1419,21 +1419,27 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         network_logvol -= benchmark_logvol
 
         if self.has_sngl_hist and self.sngl_hist is not None:
-            # Evaluate p(rho | S) from the 1D model
-            sngls_binned = []
+            # Evaluate p(rho | S) from the model (now 2D due to the dummy dimension)
             sngls_snrs = numpy.log(sngls['snr'])
-            sngls_binned.append(sngls_snrs)
-            x = numpy.column_stack(sngls_binned)
+            
+            # 1. Create the dummy column of zeros
+            dummy_noise = numpy.zeros_like(sngls_snrs)
+            
+            # 2. Stack them: column 0 is your SNR, column 1 is the helper 0
+            # This results in shape (N, 2)
+            x = numpy.column_stack([sngls_snrs, dummy_noise])
+            
+            # 3. Evaluate. The log_prob will now work without the Reshape RuntimeError.
             ln_s = self.sngl_hist.log_prob(x)
-            ln_s -= x[:,-1]
-            print("check")
+            ln_s -= sngls_snrs
+            
             
         else:
             # Fallback to the current analytic prior-ish scaling
             ln_s = -4 * numpy.log(sngls['snr'] / self.ref_snr)
-            print("Failing back to old prior")
-        
-        loglr = network_logvol - ln_noise_rate + ln_s
+            
+        ln_r = numpy.log(1/(10. ** (-5) * numpy.sqrt(2**numpy.pi)))
+        loglr = network_logvol - ln_noise_rate + ln_s - ln_r
         loglr += self.stat_correction
         # cut off underflowing and very small values
         loglr[loglr < -30.] = -30.
@@ -1469,7 +1475,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # determined by the least sensitive ifo
         network_sigmasq = numpy.amin([sngl[1]['sigmasq'] for sngl in s],
                                      axis=0)
-        print(self.model_ifos, network_sigmasq)
+        
         # Volume \propto sigma^3 or sigmasq^1.5
         network_logvol = 1.5 * numpy.log(network_sigmasq)
         # Get benchmark log volume as single-ifo information :
