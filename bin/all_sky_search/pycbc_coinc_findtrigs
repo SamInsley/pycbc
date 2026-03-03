@@ -5,7 +5,7 @@ from ligo.segments import infinity
 from pycbc.events import veto, coinc, stat, cuts
 import pycbc
 import pycbc.version
-import re, glob
+import os, re, glob
 from pycbc import pool, init_logging
 from numpy.random import seed, shuffle
 from pycbc.io.hdf import ReadByTemplate
@@ -89,20 +89,53 @@ def in_valid(t, valid):
     i = numpy.searchsorted(start, t, side="right") - 1
     return (i >= 0) & (t < end[i])
 def infer_trigger_file_for_ifo(cond_ifo, trigger_files):
-    sample = trigger_files[0]
-    d = os.path.dirname(sample) or "."
-    m = re.search(r"-([0-9]{9,})-([0-9]{4,})\.hdf$", sample)
-    if not m:
-        return None
-    gps, dur = m.group(1), m.group(2)
+    """
+    Infer the per-IFO merged trigger file for cond_ifo in a workflow-safe way.
 
-    pats = [
-        os.path.join(d, f"{cond_ifo}-HDF_TRIGGER_MERGE*-{gps}-{dur}.hdf"),
+    Key idea:
+    - args.trigger_files may contain submit-host absolute paths that don't exist
+      on execute nodes.
+    - Pegasus stages inputs into the job working dir, usually by basename.
+    So: parse gps/dur from the *basename* and search in '.' first.
+    """
+    if not trigger_files:
+        return None
+
+    # Find any trigger file name we can parse gps/dur from (use basenames!)
+    gps = dur = None
+    for tf in trigger_files:
+        base = os.path.basename(tf)
+        m = re.search(r"-([0-9]{9,})-([0-9]{4,})\.hdf(?:\.gz)?$", base)
+        if m:
+            gps, dur = m.group(1), m.group(2)
+            break
+    if gps is None:
+        return None
+
+    # Directories to search:
+    # 1) job sandbox
+    # 2) any trigger_file directory that actually exists *on this node*
+    search_dirs = ["."]
+    for tf in trigger_files:
+        d = os.path.dirname(tf)
+        if d and os.path.isdir(d) and d not in search_dirs:
+            search_dirs.append(d)
+
+    # Be generous about filename variants
+    patterns = [
+        "{ifo}-HDF_TRIGGER_MERGE*-{gps}-{dur}.hdf",
+        "{ifo}-HDF_TRIGGER_MERGE*-{gps}-{dur}.hdf.gz",
+        "{ifo}-TRIGGERS*-{gps}-{dur}.hdf",
+        "{ifo}-TRIGGERS*-{gps}-{dur}.hdf.gz",
     ]
-    for pat in pats:
-        hits = sorted(glob.glob(pat))
-        if hits:
-            return hits[0]
+
+    for d in search_dirs:
+        for p in patterns:
+            pat = os.path.join(d, p.format(ifo=cond_ifo, gps=gps, dur=dur))
+            hits = sorted(glob.glob(pat))
+            if hits:
+                return hits[0]
+
     return None
 
 def load_cond_ifo_valid_from_triggerfile(cond_ifo, args):
@@ -117,68 +150,6 @@ def load_cond_ifo_valid_from_triggerfile(cond_ifo, args):
                          args.gating_veto_windows)
     return veto.segments_to_start_end(copy.copy(rdr.segs))
 
-def try_read_segments_from_file(fname, ifo):
-    """
-    Search an HDF file for segment datasets for `ifo` by scanning all dataset names.
-    We look for datasets whose name contains the IFO string and ends with '/start',
-    and then require the corresponding '/end' dataset with the same prefix.
-    """
-    ifo_low = ifo.lower()
-
-    try:
-        with h5py.File(fname, "r") as f:
-            start_paths = []
-
-            def visitor(name, obj):
-                if isinstance(obj, h5py.Dataset):
-                    low = name.lower()
-                    if low.endswith("/start") and ifo_low in low and "segments" in low:
-                        start_paths.append(name)
-
-            f.visititems(visitor)
-
-            # Prefer the most "direct" looking paths first (shortest names)
-            start_paths.sort(key=len)
-
-            for sp in start_paths:
-                ep = sp[:-len("/start")] + "/end"
-                if ep in f:
-                    start = f[sp][:]
-                    end = f[ep][:]
-                    # Basic sanity: same length and non-decreasing
-                    if len(start) == len(end) and (len(start) == 0 or (start[0] <= end[0])):
-                        logging.info("Found %s segments in %s at %s", ifo, fname, sp)
-                        logging.info("DEBUG: using segment datasets %s and %s", sp, ep)
-                        return start, end
-
-    except OSError:
-        # Not an HDF file (e.g. XML veto file) or unreadable
-        return None
-    except Exception:
-        return None
-
-    return None
-
-def load_cond_ifo_segments(cond_ifo, args, rank_method):
-    """
-    Try to find (start,end) segments for cond_ifo from files we already have:
-      - trigger files
-      - veto files
-      - statistic files (rank_method.files values)
-    """
-    search_files = []
-    search_files += list(args.trigger_files)
-    search_files += list(args.veto_files)
-    if hasattr(rank_method, "files"):
-        search_files += list(rank_method.files.values())
-
-    for fname in search_files:
-        segs = try_read_segments_from_file(fname, cond_ifo)
-        if segs is not None:
-            logging.info("Loaded %s segments from %s (nseg=%d)",
-                         cond_ifo, fname, len(segs[0]))
-            return segs
-    return None
 
 def parse_template_range(num_templates, rangestr):
     part = int(rangestr.split('/')[0])
@@ -191,9 +162,7 @@ logging.info('Starting...')
 
 trigger_cut_dict, template_cut_dict = cuts.ingest_cuts_option_group(args)
 
-with h5py.File(args.template_bank, "r") as fb:
-    num_templates = len(fb['template_hash'])
-
+num_templates = len(h5py.File(args.template_bank, "r")['template_hash'])
 tmin, tmax = parse_template_range(num_templates, args.template_fraction_range)
 logging.info('Analyzing template %s - %s' % (tmin, tmax-1))
 
@@ -293,6 +262,45 @@ for sngl in trigs.singles:
     sngl.segs = coinc_segs
     sngl.valid = veto.segments_to_start_end(sngl.segs)
 
+# Find the ratio of times were the conditional IFO is on vs off for the whole chunk
+
+def start_end_to_seglist(start_end):
+    if start_end is None:
+        return None
+    s, e = start_end
+    return veto.start_end_to_segments(s, e)
+
+def seg_livetime(seglist):
+    return float(abs(seglist))
+
+cond_chunk = None
+if cond_ifo is not None and cond_ifo in ifo_valid:
+    base = coinc_segs  # analysed time for the running pair (e.g. LV)
+    cond_seg = start_end_to_seglist(ifo_valid[cond_ifo])
+
+    on  = base & cond_seg
+    off = base - cond_seg
+
+    base_t = seg_livetime(base)
+    on_t   = seg_livetime(on)
+    off_t  = seg_livetime(off)
+
+    on_frac = (on_t / base_t) if base_t > 0 else 0.0
+    # on/off ratio (guard divide-by-zero)
+    on_off_ratio = (on_t / off_t) if off_t > 0 else numpy.inf
+
+    cond_chunk = {
+        "cond_ifo": cond_ifo,
+        "base_time": base_t,
+        "on_time": on_t,
+        "off_time": off_t,
+        "on_frac": on_frac,
+        "on_off_ratio": on_off_ratio,
+    }
+
+    logging.info("COND CHUNK %s: base=%.1fs on=%.1fs off=%.1fs on_frac=%.3f on/off=%.3f",
+                 cond_ifo, base_t, on_t, off_t, on_frac, on_off_ratio)
+
 # DEBUG B: show coinc-only livetime
 coinc_start, coinc_end = trigs.singles[0].valid
 coinc_livetime = float(numpy.sum(coinc_end - coinc_start)) if len(coinc_start) else 0.0
@@ -302,6 +310,7 @@ logging.info("DEBUG coinc intersection livetime=%.1f s (segments=%d)",
 # Stat class instance to calculate the coinc ranking statistic
 rank_method = stat.get_statistic_from_opts(args, trigs.ifos)
 
+
 # If we need segments for the conditional IFO but didn't load triggers for it,
 # try to obtain them from existing files already passed to the job.
 if cond_ifo is not None and cond_ifo not in ifo_valid:
@@ -310,14 +319,52 @@ if cond_ifo is not None and cond_ifo not in ifo_valid:
 
     segs = load_cond_ifo_valid_from_triggerfile(cond_ifo, args)
     if segs is None:
-        raise RuntimeError(
-            f"Cannot compute conditional flag: missing analysed segments for {cond_ifo}. "
-            f"Could not infer {cond_ifo} trigger file from existing --trigger-files."
-        )
-    ifo_valid[cond_ifo] = segs
-    s, e = segs
-    logging.info("Loaded %s analysed segments: nseg=%d livetime=%.1f s",
+        cond_ifo = None
+        logging.warning("Could not find trigger file for cond_ifo=%s; conditional flags will not be set.", cond_ifo)
+    else:
+        ifo_valid[cond_ifo] = segs
+        s, e = segs
+        logging.info("Loaded %s analysed segments: nseg=%d livetime=%.1f s",
                  cond_ifo, len(s), float((e - s).sum()) if len(s) else 0.0)
+
+# Find the ratio of times were the conditional IFO is on vs off for the whole chunk
+
+def start_end_to_seglist(start_end):
+    if start_end is None:
+        return None
+    s, e = start_end
+    return veto.start_end_to_segments(s, e)
+
+def seg_livetime(seglist):
+    return float(abs(seglist))
+
+cond_chunk = None
+if cond_ifo is not None and cond_ifo in ifo_valid:
+    base = coinc_segs  # analysed time for the running pair (e.g. LV)
+    cond_seg = start_end_to_seglist(ifo_valid[cond_ifo])
+
+    on  = base & cond_seg
+    off = base - cond_seg
+
+    base_t = seg_livetime(base)
+    on_t   = seg_livetime(on)
+    off_t  = seg_livetime(off)
+
+    on_frac = (on_t / base_t) if base_t > 0 else 0.0
+    # on/off ratio (guard divide-by-zero)
+    on_off_ratio = (on_t / off_t) if off_t > 0 else numpy.inf
+
+    cond_chunk = {
+        "cond_ifo": cond_ifo,
+        "base_time": base_t,
+        "on_time": on_t,
+        "off_time": off_t,
+        "on_frac": on_frac,
+        "on_off_ratio": on_off_ratio,
+    }
+
+    logging.info("COND CHUNK %s: base=%.1fs on=%.1fs off=%.1fs on_frac=%.3f on/off=%.3f",
+                 cond_ifo, base_t, on_t, off_t, on_frac, on_off_ratio)
 
 # Sanity check, time slide interval should be larger than twice the
 # Earth crossing time, which is approximately 0.085 seconds.
@@ -428,20 +475,23 @@ def process_template(tnum):
         min_snr = None
         max_sigmasq = None
 
+    # Test whether sds_full contains single arrays or record arrays
+    # this depends on the stat being used
     try:
-        pivot_stat0 = sds_full[args.pivot_ifo]['snglstat'].copy()
-        fixed_stat0 = sds_full[args.fixed_ifo]['snglstat'].copy()
-    except Exception:
-        pivot_stat0 = sds_full[args.pivot_ifo].copy()
-        fixed_stat0 = sds_full[args.fixed_ifo].copy()
+        pivot_stat = sds_full[args.pivot_ifo]['snglstat'].copy()
+        fixed_stat = sds_full[args.fixed_ifo]['snglstat'].copy()
+    except IndexError:
+        pivot_stat = sds_full[args.pivot_ifo].copy()
+        fixed_stat = sds_full[args.fixed_ifo].copy()
 
-    pivot_sort = numpy.argsort(pivot_stat0)
-    fixed_sort = numpy.argsort(fixed_stat0)
+    pivot_sort = numpy.argsort(pivot_stat)
+    fixed_sort = numpy.argsort(fixed_stat)
 
     if not rank_method.single_increasing:
         pivot_sort = pivot_sort[::-1]
         fixed_sort = fixed_sort[::-1]
-
+    
+    # Loop over the single triggers and calculate the coincs they can form
     start0 = 0
     while start0 < len(sds_full[args.fixed_ifo]):
         start1 = 0
@@ -460,7 +510,8 @@ def process_template(tnum):
 
         tids = tids_full.copy()
         tids[args.fixed_ifo] = tids_full[args.fixed_ifo][fixed_idxs]
-
+        
+        # if decimation is being used precalculate the fixed network coincidences
         if len(threshes) > 1:
             fixed_ifos = [i for i in trigs.ifos if i != args.pivot_ifo]
             fixed_times = {i: times[i] for i in fixed_ifos}
@@ -473,7 +524,8 @@ def process_template(tnum):
                 if len(fixed_slide) == 0:
                     start0 += args.batch_singles
                     continue
-
+                
+                # list in ifo order of remaining trigger data
                 fixed_single_info = [(i, sds[i][fixed_ids[i]]) for i in fixed_ifos]
                 fixed_times = {i: fixed_times[i][fixed_ids[i]] for i in fixed_ifos}
             else:
@@ -494,7 +546,10 @@ def process_template(tnum):
             )
             if not rank_method.single_increasing:
                 pivot_lims[kidx] *= -1.
+            # subtract small amount to account for errors due to rounding
             pivot_lims[kidx] -= 1e-6
+            # Get the minimum statistic required for all triggers at the
+            # current decimation threshold
             pivot_lower[kidx] = pivot_lims[kidx].min()
 
         while start1 < len(sds_full[args.pivot_ifo]):
@@ -507,7 +562,8 @@ def process_template(tnum):
             times[args.pivot_ifo] = times_full[args.pivot_ifo][pivot_idxs]
             sds[args.pivot_ifo] = sds_full[args.pivot_ifo][pivot_idxs]
             tids[args.pivot_ifo] = tids_full[args.pivot_ifo][pivot_idxs]
-
+            
+            # Do time coincidence for slides that will be kept after the last decimation
             ids, slide = coinc.time_multi_coincidence(
                 times,
                 args.timeslide_interval * total_factors[-1],
@@ -516,25 +572,38 @@ def process_template(tnum):
                 args.fixed_ifo
             )
             slide *= total_factors[-1]
-
+            cond_on_all = None
+            if cond_ifo is not None:
+                t0_all = times[args.fixed_ifo][ids[args.fixed_ifo]]
+                cond_on_all = in_valid(t0_all, ifo_valid[cond_ifo]).astype(numpy.float32)
             single_info = [(i, sds[i][ids[i]]) for i in trigs.ifos]
             cstat = rank_method.rank_stat_coinc(
                 single_info, slide, args.timeslide_interval,
                 to_shift=trigs.to_shift,
-                time_addition=args.coinc_threshold
+                time_addition=args.coinc_threshold,
+                cond_on=cond_on_all,
+                on_time=(cond_chunk["on_time"] if cond_chunk else None),
+                off_time=(cond_chunk["off_time"] if cond_chunk else None),
             )
 
+            #index values of the zerolag triggers
             fi = numpy.where(slide == 0)[0]
+
+            #index values of the background triggers
             bi = numpy.where(slide != 0)[0]
             bl = bi[cstat[bi] < threshes[-1]]
 
             ti = numpy.concatenate([fi, bl])
 
             ids = {i: t[ti] for i, t in ids.items()}
+
             cstat = cstat[ti]
             slide = slide[ti]
-            dec = numpy.concatenate([numpy.ones(len(fi)),
-                                     numpy.repeat(total_factors[-1], len(bl))])
+            dec = numpy.concatenate([numpy.ones(len(fi)), numpy.repeat(total_factors[-1], len(bl))])
+            if cond_on_all is not None:
+                cond_on = cond_on_all[ti].astype(numpy.int8)   # for saving/output
+            else:
+                cond_on = numpy.zeros(len(slide), dtype=numpy.int8)
 
             # --- conditional flag per kept coincidence (2-IFO runs only) ---
             if cond_ifo is not None:
@@ -564,54 +633,80 @@ def process_template(tnum):
             # (rest of decimation steps unchanged)
             try:
                 pivot_stat = sds[args.pivot_ifo]['snglstat'].copy()
-            except Exception:
+            except IndexError:
                 pivot_stat = sds[args.pivot_ifo].copy()
 
             if not rank_method.single_increasing:
                 pivot_stat *= -1.
 
+            # Starting from the largest decimation threshold, find the first decimation step
+            # where the loudest single detector trigger in pivot can pass the decimation threshold
+            # with any trigger in the fixed network
             tidx = len(threshes)
             for i in range(1, len(threshes)):
                 if pivot_stat[-1] >= pivot_lower[i]:
                     tidx = i
                     break
 
+            # loop through decimation steps starting from the first step where passing
+            # the threshold is possible
             for kidx in range(tidx, len(threshes)):
+
+                # Remove triggers in pivot that cannot form coincidences above
+                # the current decimation threshold
                 pivot_cut = numpy.searchsorted(pivot_stat, pivot_lower[kidx])
+
                 pivot_s = pivot_stat[pivot_cut:]
 
                 test_times = fixed_times.copy()
                 test_times[args.pivot_ifo] = times[args.pivot_ifo][pivot_cut:]
 
-                set_ids, set_slide = coinc.time_multi_coincidence(
-                    test_times,
-                    args.timeslide_interval * total_factors[kidx - 1],
-                    args.coinc_threshold,
-                    args.pivot_ifo,
-                    args.fixed_ifo
-                )
+                # Do time coincidence for the current decimation factor
+                set_ids, set_slide = coinc.time_multi_coincidence(test_times,
+                                                                  args.timeslide_interval*total_factors[kidx - 1],
+                                                                  args.coinc_threshold,
+                                                                  args.pivot_ifo,
+                                                                  args.fixed_ifo)
                 set_slide *= total_factors[kidx - 1]
 
+                # Remove foreground triggers
                 sets = set_slide != 0
+
+                # Each precalculated coincidence from the fixed network should
+                # be treated like a single trigger, only keep coincidences
+                # where all triggers from the fixed network coincidence are still
+                # together
                 for i in range(1, len(fixed_ifos)):
                     sets *= set_ids[fixed_ifos[i-1]] == set_ids[fixed_ifos[i]]
 
                 set_ids = {i: set_ids[i][sets] for i in trigs.ifos}
                 set_slide = set_slide[sets]
 
+                # Only keep coincidences where pivot has a single stat above the threshold
+                # calculated earlier
                 above = pivot_s[set_ids[args.pivot_ifo]] >= pivot_lims[kidx][set_ids[fixed_ifos[0]]]
 
                 test_ids = {i: fixed_ids[i][set_ids[i][above]] for i in fixed_ifos}
                 test_ids[args.pivot_ifo] = set_ids[args.pivot_ifo][above] + pivot_cut
                 set_slide = set_slide[above]
+
+                test_cond_on = None
+                if cond_ifo is not None:
+                    t0_test = times[args.fixed_ifo][test_ids[args.fixed_ifo]]
+                    test_cond_on = in_valid(t0_test, ifo_valid[cond_ifo]).astype(numpy.float32)
+
                 test_single_info = [(i, sds[i][test_ids[i]]) for i in trigs.ifos]
 
                 test_cstat = rank_method.rank_stat_coinc(
                     test_single_info, set_slide, args.timeslide_interval,
                     to_shift=trigs.to_shift,
-                    time_addition=args.coinc_threshold
+                    time_addition=args.coinc_threshold,
+                    cond_on=test_cond_on,
+                    on_time=(cond_chunk["on_time"] if cond_chunk else None),
+                    off_time=(cond_chunk["off_time"] if cond_chunk else None),
                 )
 
+                # Keep triggers in the current decimation range
                 test_bi = numpy.where(test_cstat >= threshes[kidx])[0]
                 test_bi = test_bi[test_cstat[test_bi] < threshes[kidx - 1]]
 
@@ -620,10 +715,8 @@ def process_template(tnum):
                 cstat = numpy.concatenate([cstat, test_cstat[test_bi]])
                 slide = numpy.concatenate([slide, set_slide[test_bi]])
                 dec = numpy.concatenate([dec, numpy.repeat(total_factors[kidx - 1], len(test_bi))])
-
-                # NOTE: cond_on/cond_ifo_arr are only computed for the initial kept set (fi+bl).
-                # If you need them for *all* appended decimated coincidences too, we can extend
-                # the logic to track those indices. For now keep it minimal.
+                if cond_ifo is not None:
+                   cond_on = numpy.concatenate([cond_on, test_cond_on[test_bi]])
 
             # temporary storage for decimated trigger ids
             for ifo in trigs.ifos:
@@ -631,7 +724,6 @@ def process_template(tnum):
                 addtriggerid = tids[ifo][ids[ifo]]
                 local_data['%s/time' % ifo] += [addtime]
                 local_data['%s/trigger_id' % ifo] += [addtriggerid]
-
             local_data['stat'] += [cstat]
             local_data['decimation_factor'] += [dec]
             local_data['timeslide_id'] += [slide]

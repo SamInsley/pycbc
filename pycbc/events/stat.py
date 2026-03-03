@@ -343,6 +343,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.relsense = {}
         self.srmax = self.srmin = None
         self.hist_max = None
+        self.on_vs_off = None
         
         # Some memory
         self.pdif = numpy.zeros(128, dtype=numpy.float64)
@@ -399,6 +400,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         self.srmax = self.model.metadata.get("smax")
         self.srmin = self.model.metadata.get("smin")
         self.hist_max = self.model.metadata.get("hist_max")
+        self.on_vs_off = self.model.metadata.get("on_vs_off")
 
         for ifo, sense in zip(self.model_ifos, self.model_relfac):
             self.relsense[ifo] = sense
@@ -497,10 +499,42 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             x = numpy.column_stack(binned)
             snrs = numpy.array([numpy.array(stats[ifo]["snr"], ndmin=1) for ifo in self.ifos])
             smin = snrs.min(axis=0)
-            rate = self.model.log_prob(x)
+            cond_on = stats.get("cond_on", None)
+
+            if cond_on is not None:
+                # Use asarray to handle cases where cond_on might be a list or a subsetted array
+                c = numpy.asarray(cond_on, dtype=numpy.float32).reshape(-1, 1)
+            else:
+                # Create a zero-filled column matching the number of coincidences (x.shape[0])
+                c = numpy.zeros((x.shape[0], 1), dtype=numpy.float32)
+
+            rate = self.model.log_prob(x, conditional=c)
             sdif_sum = x[:, 2::3].sum(axis=1)   # shape (length,)
             rate -= sdif_sum
             rate += numpy.log((smin / self.ref_snr) ** -4.)
+            if cond_on is not None:
+                print("check")
+                on_time = stats.get("on_time", None)
+                off_time = stats.get("off_time", None)
+                total_time = on_time + off_time
+                on_time_frac = on_time / total_time
+                off_time_frac = off_time / total_time
+                off_total_frac = off_time_frac * (1 / self.on_vs_off)
+                p_on_given_signal = on_time_frac / (on_time_frac + off_total_frac)
+                p_off_given_signal = off_total_frac / (on_time_frac + off_total_frac)
+                p_on = p_on_given_signal / on_time_frac
+                p_off = p_off_given_signal / off_time_frac
+                print(p_on, p_off)
+                print(cond_on)
+                cond = numpy.asarray(cond_on).astype(int)
+                on_mask = (cond == 1)
+
+                rate = numpy.asarray(rate)
+                rate[on_mask]  += numpy.log(p_on)
+                rate[~on_mask] += numpy.log(p_off)
+
+                # debug summary:
+                print("n_on =", on_mask.sum(), "n_off =", (~on_mask).sum())
             
 
         return rate
@@ -560,9 +594,15 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         [Nitz et al, 2017](https://doi.org/10.3847/1538-4357/aa8f50).
         """
         rstat = sum(s[1]['snglstat'] ** 2 for s in sngls_list)
-        cstat = rstat + 2. * self.logsignalrate(dict(sngls_list),
-                                                slide * step,
-                                                to_shift)
+        statdict = dict(sngls_list)
+        if 'cond_on' in kwargs and kwargs['cond_on'] is not None:
+            statdict['cond_on'] = kwargs['cond_on']
+        if 'on_time' in kwargs and kwargs['on_time'] is not None:
+            statdict['on_time'] = kwargs['on_time']
+        if 'off_time' in kwargs and kwargs['off_time'] is not None:
+            statdict['off_time'] = kwargs['off_time']
+
+        cstat = rstat + 2. * self.logsignalrate(statdict, slide * step, to_shift)
         cstat[cstat < 0] = 0
         return cstat ** 0.5
 
@@ -1436,6 +1476,13 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
 
         # First get signal PDF logr_s
         stat = {ifo: st for ifo, st in s}
+        if 'cond_on' in kwargs and kwargs['cond_on'] is not None:
+            stat['cond_on'] = kwargs['cond_on']
+        if 'on_time' in kwargs and kwargs['on_time'] is not None:
+            stat['on_time'] = kwargs['on_time']
+        if 'off_time' in kwargs and kwargs['off_time'] is not None:
+            stat['off_time'] = kwargs['off_time']
+
         logr_s = self.logsignalrate(stat, slide * step, to_shift)
 
         # Find total volume of phase-time-amplitude space occupied by noise

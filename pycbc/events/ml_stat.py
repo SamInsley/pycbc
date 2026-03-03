@@ -1,7 +1,7 @@
 import copy
 import numpy as np
 import logging
-from typing import Type
+from typing import Type, Dict, Optional
 import h5py
 import torch
 import tqdm
@@ -89,6 +89,7 @@ class NormalizingFlow(MLModel):
         self,
         dims: int,
         flow_class: str = "CouplingNSF",
+        conditions: int = 0,
         device: str = "cpu",
         bounds: np.ndarray = None,
         **kwargs,
@@ -96,22 +97,24 @@ class NormalizingFlow(MLModel):
 
         import glasflow.flows as gf
 
-        self.dims = dims
+        self.dims = int(dims)
         self.device = torch.device(device)
         self.data_transform = DataTransform(bounds, device=self.device)
-        self.flow_class = flow_class
-
+        self.flow_class = str(flow_class)
+        self.n_conditions = int(conditions)
         self.kwargs = self.set_defaults(**kwargs)
 
         FlowClass = getattr(gf, self.flow_class, None)
         if FlowClass is None:
             raise ValueError(f"Unknown flow class: {self.flow_class}")
-
+        
         self.flow = FlowClass(
-            n_inputs=dims,
+            n_conditional_inputs=self.n_conditions,
+            n_inputs=self.dims,
             **self.kwargs,
         )
         self.flow.to(self.device)
+       
         # self.flow.compile()
         logger.info(f"Initialized normalizing flow: \n {self.flow}\n")
 
@@ -120,7 +123,7 @@ class NormalizingFlow(MLModel):
         # This could include defaults based on e.g. the number of dimensions
         kwargs = copy.deepcopy(kwargs)
         kwargs.setdefault("n_transforms", 4)
-        kwargs.setdefault("n_neurons", 180)
+        kwargs.setdefault("n_neurons", 128)
         kwargs.setdefault("batch_norm_between_transforms", False)
         kwargs.setdefault("distribution", "uniform")
         kwargs.setdefault("num_bins", 20)
@@ -129,9 +132,12 @@ class NormalizingFlow(MLModel):
         kwargs.setdefault("min_bin_height", 1e-6)
         return kwargs
 
-    def loss_fn(self, x: torch.Tensor) -> torch.Tensor:
+    def loss_fn(self, conditions: torch.Tensor = None, x: torch.Tensor = None) -> torch.Tensor:
         """Loss function to minimize."""
-        return -self.flow.log_prob(x).mean()
+        if conditions is None:
+            return -self.flow.log_prob(x).mean()
+        else:
+            return -self.flow.log_prob(x, conditional=conditions).mean()
 
     def fit_data_transform(self, x: torch.Tensor) -> torch.Tensor:
         """Fit the data transform to the data."""
@@ -139,110 +145,103 @@ class NormalizingFlow(MLModel):
 
     def fit(
         self,
-        x,
-        n_epochs: int = 200,
+        datasets: Dict[float, np.ndarray],
+        n_epochs: int = 500,
         lr: float = 1e-3,
         batch_size: int = 5000,
         validation_fraction: float = 0.2,
         lr_annealing: bool = False,
         n_samples: int = None,
     ) -> dict:
-        """Fit the normalizing flow to the data.
-        This assumes all the data fits in memory.
-        Parameters
-        ----------
-        x: np.ndarray
-            The data to fit the model to. Shape should be (n_samples, dims).
-        n_epochs: int
-            The number of epochs to train for. Default is 100.
-        lr: float
-            The learning rate to use. Default is 1e-3.
-        batch_size: int
-            The batch size to use. Default is 500.
-        validation_fraction: float
-            The fraction of the data to use for validation. Default is 0.2.
-        lr_annealing: bool
-            Whether to use learning rate annealing. Default is False.
-        """
-        x = torch.tensor(x,dtype=torch.get_default_dtype()).to(self.device)
-        # Transform data to unit hypercube
-        x_prime = self.fit_data_transform(x)
-        # Shuffle data
+        
+        all_x, all_c = [], []
+        for conditional_item, data in datasets.items(): 
+            x = torch.tensor(data, dtype=torch.get_default_dtype(), device=self.device)
+            x_prime = self.fit_data_transform(x)
+            all_x.append(x_prime)   
 
-        indices = torch.randperm(x_prime.shape[0])
-        x_prime = x_prime[indices, ...]
-        if n_samples is not None:
-            x_prime = x_prime[:n_samples]
-        # Check for NaNs or infs
-        if torch.isnan(x_prime).any():
-            raise ValueError("Data contains NaN values.")
-        if not torch.isfinite(x_prime).all():
-            raise ValueError("Data contains infinite values.")
-        # Split into training and validation sets
-        n = x_prime.shape[0]
-        x_train = torch.as_tensor(
-            x_prime[: -int(validation_fraction * n)],
-            dtype=torch.get_default_dtype(),
-            device=self.device,
-        )
-        logger.info(
-            f"Training on {x_train.shape[0]} samples, "
-            f"validating on {x_prime.shape[0] - x_train.shape[0]} samples."
-        )
-        # Validation set
-        x_val = torch.as_tensor(
-            x_prime[-int(validation_fraction * n) :],
-            dtype=torch.get_default_dtype(),
-            device=self.device,
-        )
-        # Define data loaders for training
-        dataset = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(x_train),
-            shuffle=True,
-            batch_size=batch_size,
-        )
-        val_dataset = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(x_val),
-            shuffle=False,
-            batch_size=batch_size,
-        )
-        # Optimizer
+            if self.n_conditions > 0:
+                c = torch.full((x_prime.shape[0], self.n_conditions), conditional_item, dtype=torch.get_default_dtype(), device=self.device)
+                all_c.append(c)
+        z_prime = torch.cat(all_x, dim=0)
+        c_prime = torch.cat(all_c, dim=0) if all_c else None
+
+        # Shuffle
+        indices = torch.randperm(z_prime.shape[0], device=self.device)
+        z_prime = z_prime[indices][:n_samples]
+        if c_prime is not None:
+            c_prime = c_prime[indices][:n_samples]
+
+        
+
+        # Split train/val
+        n_train = len(z_prime) - int(validation_fraction * len(z_prime))
+        def make_loader(x, c):
+            ds = torch.utils.data.TensorDataset(x, c) if c is not None else torch.utils.data.TensorDataset(x)
+            return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+
+        train_loader = make_loader(z_prime[:n_train], c_prime[:n_train] if c_prime is not None else None)
+        val_loader = make_loader(z_prime[n_train:], c_prime[n_train:] if c_prime is not None else None)
         optimizer = torch.optim.Adam(self.flow.parameters(), lr=lr)
-        # Learning rate annealing
-        # Decay the learning rate to zero over the course of training
-        if lr_annealing:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs) if lr_annealing else None
+
         history = {"training_loss": [], "validation_loss": []}
-        # Training loop
+
         for _ in tqdm.tqdm(range(n_epochs)):
             self.flow.train()
             loss_epoch = 0.0
-            for (x_batch,) in dataset:
-                loss = self.loss_fn(x_batch)
+
+            for batch in train_loader:
                 optimizer.zero_grad()
+                
+                # Robust unpacking
+                if len(batch) == 2:
+                    x_b, c_b = batch
+                else:
+                    x_b, c_b = batch[0], None
+
+                # Shape safety (ensure [Batch, Dims])
+                if x_b.ndim == 1: x_b = x_b.unsqueeze(0)
+                if c_b is not None and c_b.ndim == 1: c_b = c_b.unsqueeze(-1)
+
+                loss = -self.flow.log_prob(x_b, conditional=c_b).mean()
                 loss.backward()
-                # We may want to clip gradients in some cases
-                # torch.nn.utils.clip_grad_norm_(flow.parameters(), 2.0)
                 optimizer.step()
                 loss_epoch += loss.item()
+
+            history["training_loss"].append(loss_epoch / len(train_loader))
+
+            # --- VALIDATION LOOP ---
+            self.flow.eval()
+            val_loss_epoch = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    if len(batch) == 2:
+                        x_b, c_b = batch
+                    else:
+                        x_b, c_b = batch[0], None
+
+                    if x_b.ndim == 1: x_b = x_b.unsqueeze(0)
+                    if c_b is not None and c_b.ndim == 1: c_b = c_b.unsqueeze(-1)
+
+                    # Using the same direct log_prob call for consistency
+                    loss = -self.flow.log_prob(x_b, conditional=c_b).mean()
+                    val_loss_epoch += loss.item()
+            
+            history["validation_loss"].append(val_loss_epoch / len(val_loader))
+
             if lr_annealing:
                 scheduler.step()
-            history["training_loss"].append(loss_epoch / len(dataset))
-            self.flow.eval()
-            val_loss = 0.0
-            for (x_batch,) in val_dataset:
-                with torch.no_grad():
-                    val_loss += self.loss_fn(x_batch).item()
-            history["validation_loss"].append(val_loss / len(val_dataset))
-        self.flow.eval()
-        return history
 
-    def sample(self, n_samples: int = 1) -> np.ndarray:
+    def sample(self, n_samples: int = 1, conditional: Optional[np.ndarray] = None) -> np.ndarray:
         """Sample from the model.
         Parameters
         ----------
         n_samples: int
             The number of samples to draw. Default is 1.
+        conditional: np.ndarray | None
+            The conditional values to use for sampling. Default is None.
         
         Returns
         -------
@@ -254,46 +253,32 @@ class NormalizingFlow(MLModel):
             self.flow.eval()
         # Disable gradients to speed up sampling
         with torch.no_grad():
-            x_prime = self.flow.sample(
-                n_samples,
-            )
-        # Transform back to original space
-        x = self.data_transform.inverse(x_prime)[0]
-        # Return as numpy array
-        return x.cpu().numpy()
+            c_t = None
+            if conditional is not None:
+                c_t = torch.tensor(conditional, dtype=torch.get_default_dtype(), device=self.device)
+            x_prime = self.flow.sample(n_samples, conditional=c_t)
+        
+        return self.data_transform.inverse(x_prime)[0].cpu().numpy()
 
-    def log_prob(self, x: np.ndarray) -> np.ndarray:
-        """Compute the log probability of the data under the model.
-        Parameters
-        ----------
-        x: np.ndarray
-            The data to compute the log probability for. Shape should be (n_samples, dims).
-        Returns
-        -------
-        log_prob: np.ndarray
-            The log probability of the data under the model. Shape is (n_samples,).
-        """
-        # Make sure the model is in eval mode
-        if self.flow.training:
-            self.flow.eval()
-        # Disable gradients to speed up computation
+    def log_prob(self, x: np.ndarray, conditional: np.ndarray = None) -> np.ndarray:
+        self.flow.eval()
         with torch.no_grad():
-            # Convert to torch tensor and move to device
-            x = torch.tensor(x,dtype=torch.get_default_dtype()).to(self.device)
-            log_prob = torch.full((len(x),),-torch.inf)
-            in_bounds = self.data_transform.in_bounds(x)
-            if not torch.any(in_bounds):
-                return log_prob.cpu().numpy()
-            # Transform to unit hypercube
-            x_prime, log_abs_det_jacobian = self.data_transform.forward(x[in_bounds])
-            # Compute log probability
-            log_prob[in_bounds] = self.flow.log_prob(x_prime) + log_abs_det_jacobian
-    
-        # Return as numpy array
-        return log_prob.cpu().numpy()
+            x_t = torch.tensor(x, dtype=torch.get_default_dtype(), device=self.device)
+            res = torch.full((len(x_t),), -torch.inf, device=self.device)
+            mask = self.data_transform.in_bounds(x_t)
+            if not torch.any(mask): return res.cpu().numpy()
 
-    def prob(self, x):
-        return np.exp(self.log_prob(x))
+            x_prime, ladj = self.data_transform.forward(x_t[mask])
+            c_t = None
+            if conditional is not None:
+                c_t = torch.tensor(conditional, dtype=torch.get_default_dtype(), device=self.device)[mask]
+                if c_t.ndim == 1: c_t = c_t.unsqueeze(-1)
+
+            res[mask] = self.flow.log_prob(x_prime, conditional=c_t) + ladj
+        return res.cpu().numpy()
+
+    def prob(self, x, condition=None):
+        return np.exp(self.log_prob(x, conditional=condition))
 
     def to_file(self, filename: str, group_name: str = "model") -> None:
         """Save to file.
@@ -327,6 +312,7 @@ class NormalizingFlow(MLModel):
         base_group.attrs["model_class"] = self.__class__.__name__
         # group called config has all the config info
         g = base_group.create_group("config")
+        g.attrs["conditions"] = int(self.n_conditions)
         g.attrs["dims"] = self.dims
         g.attrs["flow_class"] = self.flow_class
         g.attrs["bounds"] = self.data_transform.bounds.numpy()
@@ -479,7 +465,7 @@ class MLStatistic:
                 metadata_group.attrs[k] = v
             self.model.to_hdf5(f, **kwargs)
 
-    def log_prob(self, x: np.ndarray) -> np.ndarray:
+    def log_prob(self, x: np.ndarray, conditional: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Compute the log probability of the data under the model.
         Parameters
@@ -491,9 +477,9 @@ class MLStatistic:
         log_prob: np.ndarray
             The log probability of the data.
         """
-        return self.model.log_prob(x)
+        return self.model.log_prob(x, conditional=conditional)
 
-    def fit(self, x: np.ndarray, **kwargs) -> dict:
+    def fit(self, x: np.ndarray, y: np.ndarray, **kwargs) -> dict:
         """
         Fit the model to the data.
         Parameters
@@ -505,10 +491,10 @@ class MLStatistic:
         history: dict
             The training history.
         """
-        return self.model.fit(x, **kwargs)
+        return self.model.fit(x, y, **kwargs)
 
-    def prob(self, x):
-        return self.model.prob(x)
+    def prob(self, x, condition=None):
+        return self.model.prob(x, condition)
 
 
 if __name__ == "__main__":
