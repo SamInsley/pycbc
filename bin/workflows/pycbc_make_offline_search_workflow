@@ -226,7 +226,11 @@ if workflow.cp.has_option_tags('workflow-data_quality', 'no-coinc-veto',
 else:
     coinc_veto_file = final_veto_file
 
+all_ifos = set(ifo_ids.keys())
+
 for ifocomb in ifo_combos(ifo_ids.keys()):
+    cond_ifo = all_ifos - set(ifocomb)
+    cond_file  = wf.select_files_by_ifo_combination(cond_ifo, insps)
     inspcomb = wf.select_files_by_ifo_combination(ifocomb, insps)
     pivot_ifo, fixed_ifo, ordered_ifo_list = wf.get_ordered_ifo_list(ifocomb,
                                                                      ifo_ids)
@@ -236,7 +240,7 @@ for ifocomb in ifo_combos(ifo_ids.keys()):
     ctagcomb = ['full_data', coinctag]
 
     bg_file = wf.setup_interval_coinc(
-        workflow, hdfbank, inspcomb, statfiles, coinc_veto_file,
+        workflow, hdfbank, inspcomb, cond_file, statfiles, coinc_veto_file,
         final_veto_name, output_dir, pivot_ifo, fixed_ifo, tags=ctagcomb)
 
     # Optionally perform follow-up on triggers and rerank the candidates
@@ -661,7 +665,10 @@ for inj_file, tag in zip(inj_files, inj_tags):
                                                insps, output_dir, tags=ctags)
     # coincidence for injections
     inj_coinc = {}
+    all_ifos = set(ifo_ids.keys())
     for ifocomb in ifo_combos(ifo_ids.keys()):
+        cond_ifo = all_ifos - set(ifocomb)
+        cond_file  = wf.select_files_by_ifo_combination(cond_ifo, insps)
         inspcomb = wf.select_files_by_ifo_combination(ifocomb, insps)
         pivot_ifo, fixed_ifo, ordered_ifo_list = \
             wf.get_ordered_ifo_list(ifocomb, ifo_ids)
@@ -673,6 +680,7 @@ for inj_file, tag in zip(inj_files, inj_tags):
             workflow,
             hdfbank,
             inspcomb,
+            cond_file,
             statfiles,
             final_bg_files[ordered_ifo_list],
             coinc_veto_file,

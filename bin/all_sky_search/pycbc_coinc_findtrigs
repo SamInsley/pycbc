@@ -25,6 +25,8 @@ parser.add_argument("--gating-veto-windows", nargs='+',
                     help="Seconds to be vetoed before and after the central time "
                          "of each gate. Given as detector-values pairs, e.g. "
                          "H1:-1,2.5 L1:-1,2.5 V1:0,0")
+parser.add_argument("--cond-file", nargs='*', action='append', default=[],
+                    help="File containing single-detctor triggers for conditional ifo")
 parser.add_argument("--trigger-files", nargs='*', action='append', default=[],
                     help="Files containing single-detector triggers")
 parser.add_argument("--template-bank", required=True,
@@ -80,6 +82,7 @@ args = parser.parse_args()
 args.segment_name = sum(args.segment_name, [])
 args.veto_files = sum(args.veto_files, [])
 args.trigger_files = sum(args.trigger_files, [])
+args.cond_file = sum(args.cond_file, [])
 
 init_logging(args.verbose)
 
@@ -88,66 +91,44 @@ def in_valid(t, valid):
     start, end = valid
     i = numpy.searchsorted(start, t, side="right") - 1
     return (i >= 0) & (t < end[i])
-def infer_trigger_file_for_ifo(cond_ifo, trigger_files):
+
+
+def load_cond_ifo_valid_from_condfile(cond_ifo, args):
     """
-    Infer the per-IFO merged trigger file for cond_ifo in a workflow-safe way.
-
-    Key idea:
-    - args.trigger_files may contain submit-host absolute paths that don't exist
-      on execute nodes.
-    - Pegasus stages inputs into the job working dir, usually by basename.
-    So: parse gps/dur from the *basename* and search in '.' first.
+    Return (start, end) arrays for analysed segments of cond_ifo
+    sourced from args.cond_file (flattened list).
     """
-    if not trigger_files:
+    if not args.cond_file:
         return None
 
-    # Find any trigger file name we can parse gps/dur from (use basenames!)
-    gps = dur = None
-    for tf in trigger_files:
-        base = os.path.basename(tf)
-        m = re.search(r"-([0-9]{9,})-([0-9]{4,})\.hdf(?:\.gz)?$", base)
-        if m:
-            gps, dur = m.group(1), m.group(2)
-            break
-    if gps is None:
+    chosen = None
+
+    # 1) prefer a file that actually contains the cond_ifo group
+    for cf in args.cond_file:
+        try:
+            with h5py.File(cf, "r") as fp:
+                if cond_ifo in fp:
+                    chosen = cf
+                    break
+        except Exception:
+            continue
+
+    # 2) fallback: if only one cond-file provided, just use it
+    if chosen is None and len(args.cond_file) == 1:
+        chosen = args.cond_file[0]
+
+    if chosen is None:
         return None
 
-    # Directories to search:
-    # 1) job sandbox
-    # 2) any trigger_file directory that actually exists *on this node*
-    search_dirs = ["."]
-    for tf in trigger_files:
-        d = os.path.dirname(tf)
-        if d and os.path.isdir(d) and d not in search_dirs:
-            search_dirs.append(d)
+    logging.info("Using cond-file for %s segments: %s", cond_ifo, chosen)
 
-    # Be generous about filename variants
-    patterns = [
-        "{ifo}-HDF_TRIGGER_MERGE*-{gps}-{dur}.hdf",
-        "{ifo}-HDF_TRIGGER_MERGE*-{gps}-{dur}.hdf.gz",
-        "{ifo}-TRIGGERS*-{gps}-{dur}.hdf",
-        "{ifo}-TRIGGERS*-{gps}-{dur}.hdf.gz",
-    ]
-
-    for d in search_dirs:
-        for p in patterns:
-            pat = os.path.join(d, p.format(ifo=cond_ifo, gps=gps, dur=dur))
-            hits = sorted(glob.glob(pat))
-            if hits:
-                return hits[0]
-
-    return None
-
-def load_cond_ifo_valid_from_triggerfile(cond_ifo, args):
-    fname = infer_trigger_file_for_ifo(cond_ifo, args.trigger_files)
-    if fname is None:
-        return None
-    logging.info("Using %s trigger file for conditional segments: %s", cond_ifo, fname)
-    rdr = ReadByTemplate(fname,
-                         args.template_bank,
-                         args.segment_name,
-                         args.veto_files,
-                         args.gating_veto_windows)
+    rdr = ReadByTemplate(
+        chosen,
+        args.template_bank,
+        args.segment_name,
+        args.veto_files,
+        args.gating_veto_windows
+    )
     return veto.segments_to_start_end(copy.copy(rdr.segs))
 
 
@@ -262,44 +243,6 @@ for sngl in trigs.singles:
     sngl.segs = coinc_segs
     sngl.valid = veto.segments_to_start_end(sngl.segs)
 
-# Find the ratio of times were the conditional IFO is on vs off for the whole chunk
-
-def start_end_to_seglist(start_end):
-    if start_end is None:
-        return None
-    s, e = start_end
-    return veto.start_end_to_segments(s, e)
-
-def seg_livetime(seglist):
-    return float(abs(seglist))
-
-cond_chunk = None
-if cond_ifo is not None and cond_ifo in ifo_valid:
-    base = coinc_segs  # analysed time for the running pair (e.g. LV)
-    cond_seg = start_end_to_seglist(ifo_valid[cond_ifo])
-
-    on  = base & cond_seg
-    off = base - cond_seg
-
-    base_t = seg_livetime(base)
-    on_t   = seg_livetime(on)
-    off_t  = seg_livetime(off)
-
-    on_frac = (on_t / base_t) if base_t > 0 else 0.0
-    # on/off ratio (guard divide-by-zero)
-    on_off_ratio = (on_t / off_t) if off_t > 0 else numpy.inf
-
-    cond_chunk = {
-        "cond_ifo": cond_ifo,
-        "base_time": base_t,
-        "on_time": on_t,
-        "off_time": off_t,
-        "on_frac": on_frac,
-        "on_off_ratio": on_off_ratio,
-    }
-
-    logging.info("COND CHUNK %s: base=%.1fs on=%.1fs off=%.1fs on_frac=%.3f on/off=%.3f",
-                 cond_ifo, base_t, on_t, off_t, on_frac, on_off_ratio)
 
 # DEBUG B: show coinc-only livetime
 coinc_start, coinc_end = trigs.singles[0].valid
@@ -311,21 +254,20 @@ logging.info("DEBUG coinc intersection livetime=%.1f s (segments=%d)",
 rank_method = stat.get_statistic_from_opts(args, trigs.ifos)
 
 
-# If we need segments for the conditional IFO but didn't load triggers for it,
-# try to obtain them from existing files already passed to the job.
+# Load analysed segments for the conditional IFO from --cond-file (if needed)
 if cond_ifo is not None and cond_ifo not in ifo_valid:
-    logging.warning("cond_ifo=%s not in ifo_valid (have %s). Loading analysed segments from %s trigger file.",
-                    cond_ifo, list(ifo_valid.keys()), cond_ifo)
+    logging.info("cond_ifo=%s not in ifo_valid (have %s). Loading analysed segments from --cond-file.",
+                 cond_ifo, list(ifo_valid.keys()))
 
-    segs = load_cond_ifo_valid_from_triggerfile(cond_ifo, args)
+    segs = load_cond_ifo_valid_from_condfile(cond_ifo, args)
     if segs is None:
+        logging.warning("No usable --cond-file provided for cond_ifo=%s; conditional flags disabled.", cond_ifo)
         cond_ifo = None
-        logging.warning("Could not find trigger file for cond_ifo=%s; conditional flags will not be set.", cond_ifo)
     else:
         ifo_valid[cond_ifo] = segs
         s, e = segs
-        logging.info("Loaded %s analysed segments: nseg=%d livetime=%.1f s",
-                 cond_ifo, len(s), float((e - s).sum()) if len(s) else 0.0)
+        logging.info("Loaded %s analysed segments from --cond-file: nseg=%d livetime=%.1f s",
+                     cond_ifo, len(s), float((e - s).sum()) if len(s) else 0.0)
 
 # Find the ratio of times were the conditional IFO is on vs off for the whole chunk
 
@@ -572,10 +514,12 @@ def process_template(tnum):
                 args.fixed_ifo
             )
             slide *= total_factors[-1]
+            # Compute conditional flag for *all* coincidences (for ranking), if available
             cond_on_all = None
             if cond_ifo is not None:
                 t0_all = times[args.fixed_ifo][ids[args.fixed_ifo]]
                 cond_on_all = in_valid(t0_all, ifo_valid[cond_ifo]).astype(numpy.float32)
+
             single_info = [(i, sds[i][ids[i]]) for i in trigs.ifos]
             cstat = rank_method.rank_stat_coinc(
                 single_info, slide, args.timeslide_interval,
@@ -586,49 +530,23 @@ def process_template(tnum):
                 off_time=(cond_chunk["off_time"] if cond_chunk else None),
             )
 
-            #index values of the zerolag triggers
             fi = numpy.where(slide == 0)[0]
-
-            #index values of the background triggers
             bi = numpy.where(slide != 0)[0]
             bl = bi[cstat[bi] < threshes[-1]]
-
             ti = numpy.concatenate([fi, bl])
 
-            ids = {i: t[ti] for i, t in ids.items()}
-
+            ids   = {i: t[ti] for i, t in ids.items()}
             cstat = cstat[ti]
             slide = slide[ti]
-            dec = numpy.concatenate([numpy.ones(len(fi)), numpy.repeat(total_factors[-1], len(bl))])
-            if cond_on_all is not None:
-                cond_on = cond_on_all[ti].astype(numpy.int8)   # for saving/output
-            else:
-                cond_on = numpy.zeros(len(slide), dtype=numpy.int8)
+            dec   = numpy.concatenate([numpy.ones(len(fi)), numpy.repeat(total_factors[-1], len(bl))])
 
-            # --- conditional flag per kept coincidence (2-IFO runs only) ---
-            if cond_ifo is not None:
-                if cond_ifo not in ifo_valid:
-                    raise RuntimeError(f"Missing segments for conditional IFO {cond_ifo}")
-                # Use NON-slid time: fixed ifo has to_shift == 0 in this script
-                t0 = times[args.fixed_ifo][ids[args.fixed_ifo]]
-                cond_on = in_valid(t0, ifo_valid[cond_ifo]).astype(numpy.int8)
-                cond_ifo_arr = numpy.array([cond_ifo.encode('utf8')] * len(cond_on))
-                if len(cond_on):
-                    logging.info("DEBUG cond %s: on_frac=%.3f n=%d tmin=%.3f tmax=%.3f",
-                                cond_ifo, float(cond_on.mean()), len(cond_on),
-                                float(t0.min()), float(t0.max()))
-                # DEBUG E/F
-                if len(cond_on) > 0:
-                    u, cts = numpy.unique(cond_on, return_counts=True)
-                    fixed_mult = trigs.to_shift[trigs.ifos.index(args.fixed_ifo)]
-                    logging.info("DEBUG E template %d: %s cond_on unique=%s counts=%s",
-                                 tnum, cond_ifo, u.tolist(), cts.tolist())
-                    logging.info("DEBUG F template %d: fixed_ifo=%s shift_mult=%d (expect 0); example slide=%s",
-                                 tnum, args.fixed_ifo, fixed_mult,
-                                 float(slide[0]) if len(slide) else None)
+            # Save/output conditional arrays aligned to the kept set (ti)
+            if cond_ifo is not None and cond_on_all is not None:
+                cond_on = cond_on_all[ti].astype(numpy.int8)
+                cond_ifo_arr = numpy.array([cond_ifo.encode("utf8")] * len(cond_on))
             else:
                 cond_on = numpy.zeros(len(slide), dtype=numpy.int8)
-                cond_ifo_arr = numpy.array([b''] * len(slide))
+                cond_ifo_arr = numpy.array([b""] * len(slide))
 
             # (rest of decimation steps unchanged)
             try:
@@ -715,8 +633,12 @@ def process_template(tnum):
                 cstat = numpy.concatenate([cstat, test_cstat[test_bi]])
                 slide = numpy.concatenate([slide, set_slide[test_bi]])
                 dec = numpy.concatenate([dec, numpy.repeat(total_factors[kidx - 1], len(test_bi))])
-                if cond_ifo is not None:
-                   cond_on = numpy.concatenate([cond_on, test_cond_on[test_bi]])
+                if cond_ifo is not None and test_cond_on is not None:
+                    cond_on = numpy.concatenate([cond_on, test_cond_on[test_bi].astype(numpy.int8)])
+                    cond_ifo_arr = numpy.concatenate([
+                        cond_ifo_arr,
+                        numpy.array([cond_ifo.encode("utf8")] * len(test_bi))
+                    ])
 
             # temporary storage for decimated trigger ids
             for ifo in trigs.ifos:

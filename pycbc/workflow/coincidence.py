@@ -88,13 +88,15 @@ class PyCBCFindCoincExecutable(Executable):
     """Find coinc triggers using a folded interval method"""
 
     current_retention_level = Executable.ALL_TRIGGERS
-    def create_node(self, trig_files, bank_file, stat_files, veto_file,
+    def create_node(self, trig_files, cond_file, bank_file, stat_files, veto_file,
                     veto_name, template_str, pivot_ifo, fixed_ifo, tags=None):
         if tags is None:
             tags = []
         segs = trig_files.get_times_covered_by_files()
         seg = segments.segment(segs[0][0], segs[-1][1])
         node = Node(self)
+        if cond_file and len(cond_file) > 0:
+            node.add_input_list_opt('--cond-file', cond_file)
         node.add_input_opt('--template-bank', bank_file)
         node.add_input_list_opt('--trigger-files', trig_files)
         if len(stat_files) > 0:
@@ -476,7 +478,7 @@ def setup_sngls_statmap_inj(workflow, ifo, sngls_inj_files, background_file,
 
 
 def setup_interval_coinc_inj(workflow, hdfbank,
-                             inj_trig_files, stat_files,
+                             inj_trig_files, cond_file, stat_files,
                              background_file, veto_file, veto_name,
                              out_dir, pivot_ifo, fixed_ifo, tags=None):
     """
@@ -507,7 +509,7 @@ def setup_interval_coinc_inj(workflow, hdfbank,
     bg_files = []
     for i in range(factor):
         group_str = '%s/%s' % (i, factor)
-        coinc_node = findcoinc_exe.create_node(injinj_files, hdfbank,
+        coinc_node = findcoinc_exe.create_node(injinj_files, cond_file, hdfbank,
                                                stat_files,
                                                veto_file, veto_name,
                                                group_str,
@@ -524,7 +526,7 @@ def setup_interval_coinc_inj(workflow, hdfbank,
                              tags=tags + [veto_name])
 
 
-def setup_interval_coinc(workflow, hdfbank, trig_files, stat_files,
+def setup_interval_coinc(workflow, hdfbank, trig_files, cond_file, stat_files,
                          veto_file, veto_name, out_dir, pivot_ifo,
                          fixed_ifo, tags=None):
     """
@@ -549,7 +551,7 @@ def setup_interval_coinc(workflow, hdfbank, trig_files, stat_files,
     bg_files = FileList()
     for i in range(factor):
         group_str = '%s/%s' % (i, factor)
-        coinc_node = findcoinc_exe.create_node(trig_files, hdfbank,
+        coinc_node = findcoinc_exe.create_node(trig_files, cond_file, hdfbank,
                                                stat_files,
                                                veto_file, veto_name,
                                                group_str,
