@@ -252,7 +252,9 @@ def process_template(tnum):
 
 
         # get single-detector statistic
+        
         sds_full[i] = rank_method.single(sngl)[trigger_keep_ids]
+        
 
 
     mintrigs = min([len(ti) for ti in tids_full.values()])
@@ -377,12 +379,13 @@ def process_template(tnum):
             slide *= total_factors[-1]
 
             single_info = [(i, sds[i][ids[i]]) for i in trigs.ifos]
+            
             cstat = rank_method.rank_stat_coinc(
                 single_info, slide, args.timeslide_interval,
                 to_shift=trigs.to_shift,
                 time_addition=args.coinc_threshold
             )
-
+           
             #index values of the zerolag triggers
             fi = numpy.where(slide == 0)[0]
 

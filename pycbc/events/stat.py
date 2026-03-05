@@ -426,6 +426,7 @@ class PhaseTDStatistic(QuadratureSumStatistic):
         """
         # Convert time shift vector to dict, as hist ifos and self.ifos may
         # not be in same order
+        
         to_shift = {ifo: s for ifo, s in zip(self.ifos, to_shift)}
 
         if not self.has_hist:
@@ -721,6 +722,8 @@ class ExpFitStatistic(QuadratureSumStatistic):
             assert len(self.ifos) == 1
             # Should be exactly one ifo provided
             ifo = self.ifos[0]
+
+        
         # fits_by_tid is a dictionary of dictionaries of arrays
         # indexed by ifo / coefficient name / template_id
         alphai = self.fits_by_tid[ifo]['smoothed_fit_coeff'][tnum]
@@ -1310,7 +1313,11 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
             Array of log noise rate density for each input trigger.
         """
         alphai, ratei, thresh = self.find_fits(trigs)
+
+    
         newsnr = self.get_sngl_ranking(trigs)
+
+
         # Above the threshold we use the usual fit coefficient (alpha)
         # below threshold use specified alphabelow
         bt = newsnr < thresh
@@ -1340,6 +1347,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         """
 
         # single-ifo stat = log of noise rate
+        
         sngl_stat = self.lognoiserate(trigs)
         # populate other fields to calculate phase/time/amp consistency
         # and sigma comparison
@@ -1360,6 +1368,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         # Store benchmark log volume as single-ifo information since the coinc
         # method does not have access to template id
         singles['benchmark_logvol'] = self.benchmark_logvol[self.curr_tnum]
+        
         return numpy.array(singles, ndmin=1)
 
     def rank_stat_single(self, single_info,
@@ -1413,12 +1422,13 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
         numpy.ndarray
             Array of coincident ranking statistic values
         """
-
+        
         sngl_rates = {sngl[0]: sngl[1]['snglstat'] for sngl in s}
+        
         ln_noise_rate = coinc_rate.combination_noise_lograte(
                                   sngl_rates, kwargs['time_addition'])
         ln_noise_rate -= self.benchmark_lograte
-
+        
         # Network sensitivity for a given coinc type is approximately
         # determined by the least sensitive ifo
         network_sigmasq = numpy.amin([sngl[1]['sigmasq'] for sngl in s],
@@ -1462,6 +1472,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
 
         # cut off underflowing and very small values
         loglr[loglr < -30.] = -30.
+        print(loglr)
         return loglr
 
     def coinc_lim_for_thresh(self, s, thresh, limifo,

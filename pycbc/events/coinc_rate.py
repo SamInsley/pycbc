@@ -162,9 +162,21 @@ def multiifo_noise_coincident_area(ifos, slop):
         allowed_area = 0
         for i, _ in enumerate(ifos):
             allowed_area += 2 * tofs[i] * tofs[ifo2_num[i]] - tofs[i]**2
-    else:
-        raise NotImplementedError("Not able to deal with more than 3 ifos")
+    elif n_ifos == 4:
+        # Simple / robust for demo purposes:
+        # tau = max TOF between any pair + slop
+        max_tof = 0.0
+        for i in range(n_ifos):
+            for j in range(i + 1, n_ifos):
+                tof = dets[ifos[i]].light_travel_time_to_detector(dets[ifos[j]])
+                if tof > max_tof:
+                    max_tof = tof
+        tau = max_tof + slop
+        allowed_area = 4.0 * tau**3  # units s^3
 
+    else:
+        raise NotImplementedError("Not able to deal with more than 4 ifos")
+    
     return allowed_area
 
 
@@ -207,7 +219,22 @@ def multiifo_signal_coincident_area(ifos):
         phi_12 = numpy.arccos((tofs[0]**2 + tofs[1]**2 - tofs[2]**2)
                               / (2 * tofs[0] * tofs[1]))
         allowed_area = numpy.pi * tofs[0] * tofs[1] * numpy.sin(phi_12)
+    elif n_ifos == 4:
+        # Simple / robust for demo purposes:
+        # reference detector is ifos[0]
+        i1, i2, i3, i4 = ifos
+        det1 = pycbc.detector.Detector(i1)
+        det2 = pycbc.detector.Detector(i2)
+        det3 = pycbc.detector.Detector(i3)
+        det4 = pycbc.detector.Detector(i4)
+
+        t12 = det1.light_travel_time_to_detector(det2)
+        t13 = det1.light_travel_time_to_detector(det3)
+        t14 = det1.light_travel_time_to_detector(det4)
+
+        allowed_area = (4.0 * np.pi / 3.0) * t12 * t13 * t14  # units s^3
+
     else:
-        raise NotImplementedError("Not able to deal with more than 3 ifos")
+        raise NotImplementedError("Not able to deal with more than 4 ifos")
 
     return allowed_area
