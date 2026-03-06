@@ -1472,7 +1472,7 @@ class ExpFitFgBgNormStatistic(PhaseTDStatistic,
 
         # cut off underflowing and very small values
         loglr[loglr < -30.] = -30.
-        print(loglr)
+        
         return loglr
 
     def coinc_lim_for_thresh(self, s, thresh, limifo,
