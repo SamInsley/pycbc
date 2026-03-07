@@ -513,7 +513,6 @@ class PhaseTDStatistic(QuadratureSumStatistic):
             rate -= sdif_sum
             rate += numpy.log((smin / self.ref_snr) ** -4.)
             if cond_on is not None:
-                print("check")
                 on_time = stats.get("on_time", None)
                 off_time = stats.get("off_time", None)
                 total_time = on_time + off_time
@@ -524,8 +523,6 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 p_off_given_signal = off_total_frac / (on_time_frac + off_total_frac)
                 p_on = p_on_given_signal / on_time_frac
                 p_off = p_off_given_signal / off_time_frac
-                print(p_on, p_off)
-                print(cond_on)
                 cond = numpy.asarray(cond_on).astype(int)
                 on_mask = (cond == 1)
 
