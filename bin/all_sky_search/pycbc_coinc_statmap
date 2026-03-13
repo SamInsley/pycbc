@@ -297,6 +297,10 @@ if fore_locs.sum() > 0:
     for key, value in exc_sig_info.items():
         f['foreground'].attrs[key + '_exc'] = value
 else:
+    ifar = numpy.array([])
+    fap = numpy.array([])
+    ifar_exc = numpy.array([])
+    fap_exc = numpy.array([])
     f['foreground/ifar'] = numpy.array([])
     f['foreground/fap'] = numpy.array([])
     f['foreground/ifar_exc'] = numpy.array([])
