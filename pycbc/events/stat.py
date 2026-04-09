@@ -518,20 +518,9 @@ class PhaseTDStatistic(QuadratureSumStatistic):
                 total_time = on_time + off_time
                 on_time_frac = on_time / total_time
                 off_time_frac = off_time / total_time
-                off_total_frac = off_time_frac * (1 / self.on_vs_off)
-                p_on_given_signal = on_time_frac / (on_time_frac + off_total_frac)
-                p_off_given_signal = off_total_frac / (on_time_frac + off_total_frac)
-                p_on = p_on_given_signal / on_time_frac
-                p_off = p_off_given_signal / off_time_frac
-                cond = numpy.asarray(cond_on).astype(int)
-                on_mask = (cond == 1)
-
-                rate = numpy.asarray(rate)
-                rate[on_mask]  += numpy.log(p_on)
-                rate[~on_mask] += numpy.log(p_off)
-
-                # debug summary:
-                print("n_on =", on_mask.sum(), "n_off =", (~on_mask).sum())
+                on_time_frac_scaled = on_time_frac * self.on_vs_off
+                scale_factor = off_time_frac + on_time_frac_scaled
+                rate += numpy.log(scale_factor)
             
 
         return rate
