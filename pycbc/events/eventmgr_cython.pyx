@@ -3,6 +3,7 @@ cimport numpy as cnp
 import cython
 from cython import wraparound, boundscheck, cdivision
 from libc.math cimport M_PI, sqrt, rint
+from libc.fenv cimport fegetround, fesetround, FE_TONEAREST
 from libc.math cimport round as cround
 
 
@@ -64,6 +65,10 @@ def logsignalrateinternals_computepsignalbins(
 ):
     cdef:
         int idx, ridx
+
+    # Need to ensure C is rounding to nearest integer.
+    if fegetround() != FE_TONEAREST:
+        fesetround(FE_TONEAREST)
 
     for idx in range(length):
         ridx = rtype[idx]
