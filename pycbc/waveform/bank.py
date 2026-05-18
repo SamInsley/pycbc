@@ -1332,23 +1332,42 @@ class _PhenomTemplate():
                 thetaJN, alpha0, tilt1, tilt2, phi12, a1, a2,
                 self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, self.fref, phi0
             )
+        hp = None
         LALparams = lal.CreateDict()
         # The flags below change the euler angles to Spin-Taylor
         if self.flag == True:
             lalsim.SimInspiralWaveformParamsInsertPhenomXPrecVersion(LALparams, 320)
             lalsim.SimInspiralWaveformParamsInsertPhenomXPFinalSpinMod(LALparams, 2)
+        denom = 1
+        for denom in [1, 2, 4, 8, 16]:
+            try:
+                hp, hc = lalsim.SimInspiralFD(
+                    self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x, spin1y,
+                    spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI, iota, phi0,
+                    0, 0, 0, df/denom, self.flow, f_final, self.fref, LALparams,
+                    lalsim.GetApproximantFromString(self.approximant)
+                )
+                denom = denom
+                break
+            except RuntimeError:
+                continue
 
-        # generate hp, hc for given orientation with lalsimulation
-        return lalsim.SimInspiralFD(
+        if hp is None:
+            denom = 1
+            # nothing worked, resort to MSA
+            LALparams = lal.CreateDict()
+            hp, hc = lalsim.SimInspiralFD(
             self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x, spin1y,
             spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI, iota, phi0,
             0, 0, 0, df, self.flow, f_final, self.fref, LALparams,
             lalsim.GetApproximantFromString(self.approximant)
         )
+                # generate hp, hc for given orientation with lalsimulation
+        return hp, hc, denom
 
     def gen_harmonics_comp(self, thetaJN, alpha0, phi0, psi, df, f_final):
         # generate hp, hc
-        hp, hc = self.gen_hp_hc(thetaJN, alpha0, phi0, df, f_final)
+        hp, hc, denom = self.gen_hp_hc(thetaJN, alpha0, phi0, df, f_final)
         # 1908.05707 defines psi in J-aligned frame. Need to rotate to
         # L-aligned frame and multiply by w+, wx
         dpsi = _dpsi(thetaJN, alpha0, self.beta)
@@ -1360,7 +1379,7 @@ class _PhenomTemplate():
         h *= np.exp(2j * _dphi(thetaJN, alpha0, self.beta))
         # create LAL frequency array and return precessing harmonic
 
-        new = FrequencySeries(h[:], delta_f=df, epoch=hp.epoch, copy=False)
+        new = FrequencySeries(h[:], delta_f=df/denom, epoch=hp.epoch, copy=False)
 
         # Phenom is *very* annoying for a F-domain waveform, and does not
         # obey the convention of having the merger at the end of the returned
@@ -1454,9 +1473,17 @@ class _PhenomTemplate():
         return h1, h2, h3, h4, h5
 
     def wn_cython(self, hs, ASD, flen, df, kmin, kmax):
+        from pycbc.types.array_cpu import whiten_and_normalize_five
+        from pycbc.types.array_cpu import whiten_and_normalize_four
         from pycbc.types.array_cpu import whiten_and_normalize_three
         from pycbc.types.array_cpu import whiten_and_normalize_two
         from pycbc.types.array_cpu import whiten_and_normalize_one
+        if len(hs) == 5:
+            whiten_and_normalize_five(hs[0].data, hs[1].data, hs[2].data, hs[3].data, hs[4].data,
+                                       ASD.data, flen, df, kmin, kmax)
+        if len(hs) == 4:
+            whiten_and_normalize_four(hs[0].data, hs[1].data, hs[2].data, hs[3].data,
+                                       ASD.data, flen, df, kmin, kmax)
         if len(hs) == 3:
             whiten_and_normalize_three(hs[0].data, hs[1].data, hs[2].data,
                                        ASD.data, flen, df, kmin, kmax)
@@ -1468,7 +1495,7 @@ class _PhenomTemplate():
 
 
     def whiten_and_normalize(self, hs, ASD, flen, df, kmin, kmax):
-        if len(hs) in [3,2,1]:
+        if len(hs) in [5,4,3,2,1]:
             self.wn_cython(hs, ASD, flen, df, kmin, kmax)
             return
         raise NotImplementedError()
@@ -1522,7 +1549,6 @@ class _PhenomTemplate():
         ASD = psd ** 0.5
         kmin = int(self.flow / df)
         kmax = int(self.f_final / df)
-
         if len(h1) > len(ASD):
             err_msg = "waveform has length greater than ASD; cannot whiten"
             raise ValueError(err_msg)

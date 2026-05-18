@@ -13,6 +13,7 @@ cython
 lalsuite!=7.2
 lscsoft-glue>=1.59.3
 igwn-segments
+ligo-segments
 tqdm
 gwdatafind>=1.1.3
 
