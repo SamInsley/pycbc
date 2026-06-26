@@ -1042,6 +1042,8 @@ class MatchedFilterTHAControl(object):
         self.snr_mem5 = zeros(self.tlen, dtype=self.dtype)
         self.snr_mem_comps = [self.snr_mem1, self.snr_mem2, self.snr_mem3,
                               self.snr_mem4, self.snr_mem5]
+        self.first_harm_thresh = zeros(self.tlen, dtype=self.dtype)
+        self.snr_mem_cluster = zeros(self.tlen, dtype=self.dtype)
 
         self.corr_mem1 = zeros(self.tlen, dtype=self.dtype)
         self.corr_mem2 = zeros(self.tlen, dtype=self.dtype)
@@ -1055,7 +1057,7 @@ class MatchedFilterTHAControl(object):
         # setup the threasholding/clustering operations for each segment
         self.threshold_and_clusterers = []
         for seg in self.segments:
-            thresh = events.ThresholdCluster(self.snr_mem[seg.analyze])
+            thresh = events.ThresholdCluster(self.first_harm_thresh[seg.analyze])
             thresh.mem_slice = seg.analyze
             self.threshold_and_clusterers.append(thresh)
 
@@ -1091,7 +1093,7 @@ class MatchedFilterTHAControl(object):
         else:
             self.snr_mem.data[:] += squared_norm(self.snr_mem_comps[i])
 
-    def tha_matched_filter_and_cluster(self, segnum, template_norm, window, epoch=None, num_comps=5):
+    def tha_matched_filter_and_cluster(self, segnum, template_norm, window, epoch=None, num_comps=5, bank_num_comps=5):
         """ Returns the complex snr timeseries, normalization of the complex snr,
         the correlation vector frequency series, the list of indices of the
         triggers, and the snr values at the trigger locations. Returns empty
@@ -1124,17 +1126,53 @@ class MatchedFilterTHAControl(object):
         """
         logging.info("Using %d comps" % num_comps)
         norm = (4.0 * self.delta_f)
+
+        from pycbc.types.array_cpu import squared_norm
+
+        self.snr_mem.clear()
+        self.snr_mem_cluster.clear()
+
         for i in range(num_comps):
             self.run_correlators(segnum, i)
             self.iffts[i].execute()
-            self.get_squared_norm(i)
 
-        thresh = self.snr_threshold[num_comps - 1]
-        snrv, idx = self.threshold_and_clusterers[segnum].threshold_and_cluster((thresh / norm)**2, window)
-        #shifted_idxs = self.segments[segnum].analyze.start + idx
+            comp_snrsq = squared_norm(self.snr_mem_comps[i])
+
+            # Full optimal SNR^2 (all filtered harmonics)
+            if i == 0:
+                self.snr_mem.data[:] = comp_snrsq
+                self.first_harm_thresh.data[:] = comp_snrsq
+            else:
+                self.snr_mem.data[:] += comp_snrsq
+
+            # SNR^2 used for clustering (only up to bank_num_comps)
+            if i < bank_num_comps:
+                self.snr_mem_cluster.data[:] += comp_snrsq
+
+        thresh = self.snr_threshold[0]
+        # snrv, idx = self.threshold_and_clusterers[segnum].threshold_and_cluster((thresh / norm)**2, window)
+        # #shifted_idxs = self.segments[segnum].analyze.start + idx
+        # snrv = snrv**0.5
+        # #self.snr_mem.data[shifted_idxs] = self.snr_mem.data[shifted_idxs]**0.5
+        
+        # Find all samples where harmonic 1 exceeds threshold
+        idx, _ = events.threshold_only(
+            self.first_harm_thresh[self.segments[segnum].analyze],
+            (thresh / norm)**2
+        )
+
+        if len(idx) == 0:
+            return [], [], [], [], [], []
+
+        # Get the combined SNR^2 values at those samples
+        idx_full = idx + self.segments[segnum].analyze.start
+        snrv = self.snr_mem_cluster[idx_full]
+
+        # Cluster using combined SNR^2
+        idx, snrv = events.cluster_reduce(idx, snrv, window)
+
+        # Convert SNR^2 -> SNR
         snrv = snrv**0.5
-        #self.snr_mem.data[shifted_idxs] = self.snr_mem.data[shifted_idxs]**0.5
-
 
         if len(idx) == 0:
             return [], [], [], [], [], []

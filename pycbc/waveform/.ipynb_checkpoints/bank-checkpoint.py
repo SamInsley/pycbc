@@ -1094,8 +1094,7 @@ class FilterBankTHA(TemplateBank):
             self.curr_tmp = curr_tmp
         else:
             curr_tmp = self.curr_tmp
-        num_comps = min(self.table["max_comps"][index], self.max_num_comps)
-        bank_num_comps = int(self.table["num_comps"][index])
+        num_comps = min(self.table["num_comps"][index], self.max_num_comps)
         hcomps = curr_tmp.get_whitened_normalized_comps(self.delta_f, psd,
                                                         num_comps=num_comps)
 
@@ -1110,7 +1109,6 @@ class FilterBankTHA(TemplateBank):
         hcomps[0].end_idx = int(hcomps[0].end_frequency / hcomps[0].delta_f)
         hcomps[0].params = self.table[index]
         hcomps[0].approximant = approximant
-        hcomps[0].bank_num_comps = bank_num_comps
 
         if hcomps[1] is not None:
             tempoutcomp2.data[:] = hcomps[1].data[:]
@@ -1121,7 +1119,6 @@ class FilterBankTHA(TemplateBank):
             hcomps[1].end_idx = int(hcomps[0].end_frequency / hcomps[0].delta_f)
             hcomps[1].params = self.table[index]
             hcomps[1].approximant = approximant
-            hcomps[1].bank_num_comps = bank_num_comps
 
         if hcomps[2] is not None:
             tempoutcomp3.data[:] = hcomps[2].data[:]
@@ -1132,7 +1129,6 @@ class FilterBankTHA(TemplateBank):
             hcomps[2].end_idx = int(hcomps[0].end_frequency / hcomps[0].delta_f)
             hcomps[2].params = self.table[index]
             hcomps[2].approximant = approximant
-            hcomps[2].bank_num_comps = bank_num_comps
 
         if hcomps[3] is not None:
             tempoutcomp4.data[:] = hcomps[3].data[:]
@@ -1143,7 +1139,6 @@ class FilterBankTHA(TemplateBank):
             hcomps[3].end_idx = int(hcomps[0].end_frequency / hcomps[0].delta_f)
             hcomps[3].params = self.table[index]
             hcomps[3].approximant = approximant
-            hcomps[3].bank_num_comps = bank_num_comps
 
         if hcomps[4] is not None:
             tempoutcomp5.data[:] = hcomps[4].data[:]
@@ -1154,7 +1149,6 @@ class FilterBankTHA(TemplateBank):
             hcomps[4].end_idx = int(hcomps[0].end_frequency / hcomps[0].delta_f)
             hcomps[4].params = self.table[index]
             hcomps[4].approximant = approximant
-            hcomps[4].bank_num_comps = bank_num_comps
 
         return hcomps
 

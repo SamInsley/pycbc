@@ -216,8 +216,8 @@ def compute_harmonic_waveform(trigs, special_idx, ifo, merge_psd_file,
     flen = int(sample_rate * segment_length/2+1)
     ncomp = trigs.bank['num_comps'][bad_tempid]
     # Hardcoded max numcomps for now:
-    if ncomp > 3:
-        ncomp = 3
+    if ncomp > 5:
+        ncomp = 5
 
     phenom_object = PhenomXPTemplate(params, sample_rate, f_lower)
 

@@ -1,7 +1,7 @@
 import numpy as np
 cimport numpy as cnp
 from cython import wraparound, boundscheck, cdivision
-from libc.math cimport M_PI, sqrt
+from libc.math cimport M_PI, sqrt, log
 from libc.math cimport round as cround
 
 
@@ -78,6 +78,67 @@ def logsignalrateinternals_computepsignalbins(
         pbin[idx] = <int>(pdif[idx] / pwidth)
         sbin[idx] = <int>(sdif[idx] / swidth)
 
+@boundscheck(False)
+@wraparound(False)
+@cdivision(True)
+def logsignalrateinternals_computepsignalbinsNF(
+    int ncomps,
+    object pdif,
+    double[:] tdif,
+    object sdif,
+    object p,
+    double[:] t,
+    object s,
+    float[:] sig,
+    object pref,
+    double[:] tref,
+    object sref,
+    float[:] sigref,
+    double[:] shift,
+    double sense,
+    double senseref,
+    int to_shift_ref,
+    int to_shift_ifo,
+    int length
+):
+    cdef:
+        int comp, idx
+        double[:] pdif_comp
+        double[:] sdif_comp
+        float[:] p_comp
+        float[:] s_comp
+        float[:] pref_comp
+        float[:] sref_comp
+
+    for comp in range(1, ncomps + 1):
+
+        pdif_comp = pdif[comp]
+        sdif_comp = sdif[comp]
+
+        p_comp = p[comp]
+        s_comp = s[comp]
+
+        pref_comp = pref[comp]
+        sref_comp = sref[comp]
+
+        for idx in range(length):
+
+            pdif_comp[idx] = (pref_comp[idx] - p_comp[idx]) % (M_PI * 2)
+
+            if pdif_comp[idx] < 0:
+                pdif_comp[idx] += (M_PI * 2)
+
+            sdif_comp[idx] = log(
+                (s_comp[idx] * sense * sqrt(sigref[idx])) /
+                (sref_comp[idx] * senseref * sqrt(sig[idx]))
+            )
+    for idx in range(length):
+        tdif[idx] = (
+            shift[idx] * to_shift_ref
+            + tref[idx]
+            - shift[idx] * to_shift_ifo
+            - t[idx]
+        )
 
 @boundscheck(False)
 @wraparound(False)
