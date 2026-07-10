@@ -3,8 +3,141 @@ statistic values
 """
 import logging
 import numpy
+import h5py
 
 logger = logging.getLogger('pycbc.events.ranking')
+
+# Cache harmonic statistics so the HDF file is only read once
+_harmonic_stats_cache = {}
+
+
+def _load_harmonic_stats(harmonic_stats_file):
+    """
+    Load harmonic means and covariance matrices from an HDF file.
+
+    Results are cached so repeated calls to the ranking function do not
+    repeatedly read the file or invert the covariance matrices.
+    """
+    if harmonic_stats_file not in _harmonic_stats_cache:
+        with h5py.File(harmonic_stats_file, "r") as f:
+            harmonic_means = numpy.asarray(
+                f["means"][:],
+                dtype=numpy.float64
+            )
+            harmonic_covs = numpy.asarray(
+                f["covariances"][:],
+                dtype=numpy.float64
+            )
+
+        harmonic_inv_covs = numpy.linalg.pinv(harmonic_covs)
+
+        _harmonic_stats_cache[harmonic_stats_file] = (
+            harmonic_means,
+            harmonic_inv_covs
+        )
+
+    return _harmonic_stats_cache[harmonic_stats_file]
+
+def mahalanobis_weighted_snr(
+        trigs,
+        harmonic_means,
+        harmonic_inv_covs,
+        distance_threshold=2.0,
+        **kwargs):
+    """
+    Apply Mahalanobis weighting to the total SNR using the relative
+    harmonic component strengths.
+
+    The Mahalanobis input vector is
+
+        x = [
+            snr_comp_1 / snr,
+            snr_comp_2 / snr,
+            snr_comp_3 / snr
+        ]
+
+    Parameters
+    ----------
+    trigs : dict-like
+        Trigger data containing:
+            snr
+            snr_comp_1
+            snr_comp_2
+            snr_comp_3
+            template_id
+
+    harmonic_means : ndarray
+        Mean vectors for each template, shape (N_templates, 3).
+
+    harmonic_inv_covs : ndarray
+        Inverse covariance matrices for each template,
+        shape (N_templates, 3, 3).
+
+    distance_threshold : float
+        No Mahalanobis downweighting below this distance.
+
+    Returns
+    -------
+    weighted_snr : ndarray
+        Total SNR after Mahalanobis weighting.
+    """
+
+    # Total SNR for every trigger
+    snr = numpy.asarray(
+        trigs['snr'][:],
+        dtype=numpy.float64
+    )
+
+    # Relative harmonic strengths:
+    #
+    # x_i = snr_comp_i / snr
+    #
+    x = numpy.column_stack([
+        trigs['snr_comp_1'][:] / snr,
+        trigs['snr_comp_2'][:] / snr,
+        trigs['snr_comp_3'][:] / snr
+    ]).astype(numpy.float64)
+
+    # Template associated with each trigger
+    template_ids = numpy.asarray(
+        trigs['template_id'][:],
+        dtype=numpy.int64
+    )
+
+    # Select the correct mean and inverse covariance
+    # matrix for each trigger
+    means = harmonic_means[template_ids]
+    inv_covs = harmonic_inv_covs[template_ids]
+
+    delta = x - means
+
+    # Vectorised Mahalanobis distance squared:
+    #
+    # d^2 = delta^T Sigma^-1 delta
+    #
+    d_squared = numpy.einsum(
+        'ni,nij,nj->n',
+        delta,
+        inv_covs,
+        delta
+    )
+
+    # Protect against tiny negative values from numerical precision
+    d_squared = numpy.maximum(d_squared, 0.0)
+
+    distances = numpy.sqrt(d_squared)
+
+    # Default: no downweighting
+    weights = numpy.ones_like(snr)
+
+    # Downweight only triggers outside the chosen distance threshold
+    mask = distances > distance_threshold
+
+    weights[mask] = numpy.exp(
+        -0.5 * d_squared[mask]
+    )
+
+    return snr * weights
 
 
 def effsnr(snr, reduced_x2, fac=250.,
@@ -339,6 +472,49 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, **kwargs):
     )
     return numpy.array(nsnr_sg_psdt, ndmin=1, dtype=numpy.float32)
 
+def get_newsnr_sgveto_psdvar_threshold_mahalanobis(
+        trigs,
+        harmonic_stats_file=None,
+        distance_threshold=2.0,
+        **kwargs):
+    """
+    Calculate newsnr re-weighted by the sine-gaussian veto, PSD variation,
+    and thresholds, after first applying Mahalanobis weighting to the SNR.
+    """
+
+    if harmonic_stats_file is None:
+        raise ValueError(
+            "newsnr_sgveto_psdvar_threshold_mahalanobis requires "
+            "harmonic_stats_file"
+        )
+
+    harmonic_means, harmonic_inv_covs = _load_harmonic_stats(
+        harmonic_stats_file
+    )
+
+    weighted_snr = mahalanobis_weighted_snr(
+        trigs,
+        harmonic_means=harmonic_means,
+        harmonic_inv_covs=harmonic_inv_covs,
+        distance_threshold=distance_threshold
+    )
+
+    dof = 2. * trigs['chisq_dof'][:] - 2.
+
+    nsnr_sg_psdt = newsnr_sgveto_psdvar_threshold(
+        weighted_snr,
+        trigs['chisq'][:] / dof,
+        trigs['sg_chisq'][:],
+        trigs['psd_var_val'][:],
+        **kwargs
+    )
+
+    return numpy.array(
+        nsnr_sg_psdt,
+        ndmin=1,
+        dtype=numpy.float32
+    )
+
 
 sngls_ranking_function_dict = {
     'snr': get_snr,
@@ -350,6 +526,8 @@ sngls_ranking_function_dict = {
     'newsnr_sgveto_psdvar_scaled': get_newsnr_sgveto_psdvar_scaled,
     'newsnr_sgveto_psdvar_scaled_threshold':
     get_newsnr_sgveto_psdvar_scaled_threshold,
+    'newsnr_sgveto_psdvar_threshold_mahalanobis':
+    get_newsnr_sgveto_psdvar_threshold_mahalanobis,
 }
 
 # Lists of datasets required in the trigs object for each function
@@ -366,6 +544,13 @@ reqd_datasets['newsnr_sgveto_psdvar_scaled'] = \
     reqd_datasets['newsnr_sgveto_psdvar']
 reqd_datasets['newsnr_sgveto_psdvar_scaled_threshold'] = \
     reqd_datasets['newsnr_sgveto_psdvar']
+reqd_datasets['newsnr_sgveto_psdvar_threshold_mahalanobis'] = \
+    reqd_datasets['newsnr_sgveto_psdvar_threshold'] + [
+        'snr_comp_1',
+        'snr_comp_2',
+        'snr_comp_3',
+        'template_id'
+    ]
 
 
 def get_sngls_ranking_from_trigs(trigs, statname, **kwargs):
