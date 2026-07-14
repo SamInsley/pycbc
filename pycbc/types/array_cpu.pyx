@@ -115,13 +115,25 @@ def tha_orthogonalize_vecs(
         int flen
 ):
     cdef double complex overlap
+    cdef double norm_sq
     cdef double norm_fac
     cdef int ii
+
     overlap = 0
+
     for ii in range(flen):
         overlap += h1[ii].conjugate() * h2[ii] * 4. * df
 
-    norm_fac = (1 - (overlap * overlap.conjugate()).real)**0.5
+    norm_sq = 1.0 - (overlap * overlap.conjugate()).real
+
+    # Avoid NaNs when numerical errors make norm_sq <= 0
+    if norm_sq <= 0.0:
+        for ii in range(flen):
+            h2[ii] = 0.0
+        return
+
+    norm_fac = norm_sq**0.5
+
     for ii in range(flen):
         h2[ii] = (h2[ii] - overlap * h1[ii]) / norm_fac
 

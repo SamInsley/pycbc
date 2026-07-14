@@ -1333,6 +1333,7 @@ class _PhenomTemplate():
             tilt2 = 0.
         else:
             tilt2 = np.arccos(self.spin2z / a2)
+
         iota, spin1x, spin1y, spin1z, spin2x, spin2y, spin2z = \
             lalsim.SimInspiralTransformPrecessingNewInitialConditions(
                 thetaJN, alpha0, tilt1, tilt2, phi12, a1, a2,
@@ -1346,6 +1347,18 @@ class _PhenomTemplate():
             lalsim.SimInspiralWaveformParamsInsertPhenomXPFinalSpinMod(LALparams, 2)
         denom = 1
         for denom in [1, 2, 4, 8, 16]:
+             # === EXPOSE EXACT GENERATOR INPUTS ===
+            print(f"\n[CRITICAL ONSITE LAL INJECTION VALUES]")
+            print(f"  m1_si   : {self.mass1*lal.MSUN_SI}")
+            print(f"  m2_si   : {self.mass2*lal.MSUN_SI}")
+            print(f"  spins1  : ({spin1x}, {spin1y}, {spin1z})")
+            print(f"  spins2  : ({spin2x}, {spin2y}, {spin2z})")
+            print(f"  iota    : {iota}")
+            print(f"  df      : {df/denom}")
+            print(f"  flow    : {self.flow}")
+            print(f"  f_final : {f_final}")
+            print(f"  fref    : {self.fref}")
+            # =====================================
             try:
                 hp, hc = lalsim.SimInspiralFD(
                     self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x, spin1y,

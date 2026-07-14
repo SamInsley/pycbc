@@ -82,20 +82,13 @@ def mahalanobis_weighted_snr(
         Total SNR after Mahalanobis weighting.
     """
 
-    # Total SNR for every trigger
-    snr = numpy.asarray(
-        trigs['snr'][:],
-        dtype=numpy.float64
-    )
-
     # Relative harmonic strengths:
     #
     # x_i = snr_comp_i / snr
     #
     x = numpy.column_stack([
-        trigs['snr_comp_1'][:] / snr,
-        trigs['snr_comp_2'][:] / snr,
-        trigs['snr_comp_3'][:] / snr
+        trigs['snr_comp_2'][:] / trigs['snr_comp_1'][:],
+        trigs['snr_comp_3'][:] / trigs['snr_comp_1'][:],
     ]).astype(numpy.float64)
 
     # Template associated with each trigger

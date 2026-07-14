@@ -1138,6 +1138,15 @@ class MatchedFilterTHAControl(object):
 
             comp_snrsq = squared_norm(self.snr_mem_comps[i])
 
+            # if not numpy.all(numpy.isfinite(comp_snrsq)):
+            #     bad_idx = numpy.where(~numpy.isfinite(comp_snrsq))[0]
+
+            #     raise ValueError(
+            #         f"Non-finite SNR^2 found in harmonic {i + 1}. "
+            #         f"Number of bad samples: {len(bad_idx)}. "
+            #         f"First bad indices: {bad_idx[:10]}"
+            #     )
+
             # Full optimal SNR^2 (all filtered harmonics)
             if i == 0:
                 self.snr_mem.data[:] = comp_snrsq
@@ -1150,29 +1159,34 @@ class MatchedFilterTHAControl(object):
                 self.snr_mem_cluster.data[:] += comp_snrsq
 
         thresh = self.snr_threshold[0]
-        # snrv, idx = self.threshold_and_clusterers[segnum].threshold_and_cluster((thresh / norm)**2, window)
-        # #shifted_idxs = self.segments[segnum].analyze.start + idx
-        # snrv = snrv**0.5
-        # #self.snr_mem.data[shifted_idxs] = self.snr_mem.data[shifted_idxs]**0.5
-        
+
         # Find all samples where harmonic 1 exceeds threshold
         idx, _ = events.threshold_only(
-            self.first_harm_thresh[self.segments[segnum].analyze],
-            (thresh / norm)**2
+        self.first_harm_thresh[self.segments[segnum].analyze],
+        (thresh / norm)**2
         )
 
         if len(idx) == 0:
             return [], [], [], [], [], []
 
-        # Get the combined SNR^2 values at those samples
+        # Full indices for looking up values in the complete timeseries
         idx_full = idx + self.segments[segnum].analyze.start
-        snrv = self.snr_mem_cluster[idx_full]
 
-        # Cluster using combined SNR^2
-        idx, snrv = events.cluster_reduce(idx, snrv, window)
+        # SNR^2 used ONLY for deciding which sample survives clustering.
+        # This contains the sum over the first bank_num_comps harmonics.
+        cluster_snrsq = self.snr_mem_cluster[idx_full]
 
-        # Convert SNR^2 -> SNR
-        snrv = snrv**0.5
+        # Cluster using the bank_num_comps SNR^2
+        idx, _ = events.cluster_reduce(idx, cluster_snrsq, window)
+
+        if len(idx) == 0:
+            return [], [], [], [], [], []
+
+        # Get full-timeseries indices of the surviving clustered triggers
+        idx_full = idx + self.segments[segnum].analyze.start
+
+        # Returned/saved SNR is the quadrature sum over ALL filtered harmonics
+        snrv = self.snr_mem[idx_full]**0.5  
 
         if len(idx) == 0:
             return [], [], [], [], [], []
