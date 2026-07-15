@@ -98,6 +98,7 @@ class Stat(object):
 
         self.ifos = ifos or []
 
+        self.sngl_ranking = sngl_ranking
         self.sngl_ranking_kwargs = {}
         self.kwargs = {}
 
@@ -106,10 +107,11 @@ class Stat(object):
                 ranking_key = key[13:]
 
                 if ranking_key == "harmonic_stats_file":
+                    # Keep the filename as a string
                     self.sngl_ranking_kwargs[ranking_key] = value
                 else:
+                    # Existing numerical ranking options remain floats
                     self.sngl_ranking_kwargs[ranking_key] = float(value)
-
             else:
                 self.kwargs[key] = value
 

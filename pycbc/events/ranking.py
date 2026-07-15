@@ -42,96 +42,64 @@ def mahalanobis_weighted_snr(
         trigs,
         harmonic_means,
         harmonic_inv_covs,
-        distance_threshold=2.0,
+        distance_threshold=2.65,
         **kwargs):
-    """
-    Apply Mahalanobis weighting to the total SNR using the relative
-    harmonic component strengths.
 
-    The Mahalanobis input vector is
+        def get_field(name):
+            try:
+                return numpy.asarray(trigs[name])
+            except (KeyError, TypeError, IndexError):
+                return numpy.asarray(getattr(trigs, name))
 
-        x = [
-            snr_comp_1 / snr,
-            snr_comp_2 / snr,
-            snr_comp_3 / snr
-        ]
+        snr = get_field("snr").astype(numpy.float64)
+        comp1 = get_field("snr_comp_1").astype(numpy.float64)
+        comp2 = get_field("snr_comp_2").astype(numpy.float64)
+        comp3 = get_field("snr_comp_3").astype(numpy.float64)
 
-    Parameters
-    ----------
-    trigs : dict-like
-        Trigger data containing:
-            snr
-            snr_comp_1
-            snr_comp_2
-            snr_comp_3
-            template_id
+        with numpy.errstate(divide="ignore", invalid="ignore"):
+            x = numpy.column_stack([
+                numpy.log(comp2 / comp1),
+                numpy.log(comp3 / comp1),
+            ])
 
-    harmonic_means : ndarray
-        Mean vectors for each template, shape (N_templates, 3).
+        try:
+            template_ids = get_field("template_num").astype(numpy.int64)
+        except (KeyError, AttributeError):
+            template_ids = get_field("template_id").astype(numpy.int64)
 
-    harmonic_inv_covs : ndarray
-        Inverse covariance matrices for each template,
-        shape (N_templates, 3, 3).
+        if template_ids.ndim == 0:
+            template_ids = numpy.full(
+                snr.shape,
+                int(template_ids),
+                dtype=numpy.int64
+            )
 
-    distance_threshold : float
-        No Mahalanobis downweighting below this distance.
+        means = numpy.asarray(
+            harmonic_means[template_ids, 1:],
+            dtype=numpy.float64
+        )
 
-    Returns
-    -------
-    weighted_snr : ndarray
-        Total SNR after Mahalanobis weighting.
-    """
+        inv_covs = numpy.asarray(
+            harmonic_inv_covs[template_ids],
+            dtype=numpy.float64
+        ).reshape(-1, 2, 2)
 
-    # Relative harmonic strengths:
-    #
-    # x_i = snr_comp_i / snr
-    #
-    x = numpy.column_stack([
-        trigs['snr_comp_2'][:] / trigs['snr_comp_1'][:],
-        trigs['snr_comp_3'][:] / trigs['snr_comp_1'][:],
-    ]).astype(numpy.float64)
+        delta = x - means
 
-    # Template associated with each trigger
-    template_ids = numpy.asarray(
-        trigs['template_id'][:],
-        dtype=numpy.int64
-    )
+        d_squared = numpy.einsum(
+            "ni,nij,nj->n",
+            delta,
+            inv_covs,
+            delta
+        )
 
-    # Select the correct mean and inverse covariance
-    # matrix for each trigger
-    means = harmonic_means[template_ids]
-    inv_covs = harmonic_inv_covs[template_ids]
+        d_squared = numpy.maximum(d_squared, 0.0)
+        weights = numpy.ones_like(snr)
+        print(d_squared)
+        mask = numpy.sqrt(d_squared) > distance_threshold
+        weights[mask] = numpy.exp(-0.5 * d_squared[mask])
 
-    delta = x - means
-
-    # Vectorised Mahalanobis distance squared:
-    #
-    # d^2 = delta^T Sigma^-1 delta
-    #
-    d_squared = numpy.einsum(
-        'ni,nij,nj->n',
-        delta,
-        inv_covs,
-        delta
-    )
-
-    # Protect against tiny negative values from numerical precision
-    d_squared = numpy.maximum(d_squared, 0.0)
-
-    distances = numpy.sqrt(d_squared)
-
-    # Default: no downweighting
-    weights = numpy.ones_like(snr)
-
-    # Downweight only triggers outside the chosen distance threshold
-    mask = distances > distance_threshold
-
-    weights[mask] = numpy.exp(
-        -0.5 * d_squared[mask]
-    )
-
-    return snr * weights
-
+        return snr * weights
 
 def effsnr(snr, reduced_x2, fac=250.,
            **kwargs):  # pylint:disable=unused-argument
@@ -468,7 +436,7 @@ def get_newsnr_sgveto_psdvar_scaled_threshold(trigs, **kwargs):
 def get_newsnr_sgveto_psdvar_threshold_mahalanobis(
         trigs,
         harmonic_stats_file=None,
-        distance_threshold=2.0,
+        distance_threshold=2.65,
         **kwargs):
     """
     Calculate newsnr re-weighted by the sine-gaussian veto, PSD variation,
