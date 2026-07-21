@@ -24,7 +24,7 @@ from pycbc.io import HFile
 
 try:
     import torch
-    from ml_stat import MLStatistic, NormalizingFlow
+    from pycbc.events.ml_stat import MLStatistic, NormalizingFlow
     HAS_ML_STAT = True
 except ImportError:
     HAS_ML_STAT = False
@@ -79,8 +79,10 @@ parser.add_argument('--nf-neurons', type=int, default=128,
                     help="Number of neurons for the Normalizing Flow layers.")
 parser.add_argument('--nf-bins', type=int, default=20,
                     help="Number of bins for the Normalizing Flow model.")
-parser.add_argument('--nf-epochs', type=int, default=1000000,
-                    help="Number of training samples/epochs to fit the Flow.")
+parser.add_argument('--nf-samples', type=int, default=1000000,
+                    help="Number of training samples to fit the Flow.")
+parser.add_argument('--nf-epochs', type=int, default=500,
+                    help="Number of epochs for the Flow.")
 args = parser.parse_args()
 
 if len(args.relative_sensitivities) != len(args.ifos):
@@ -163,9 +165,6 @@ if max_td < 0.0425:
                        'travel time. Some observatories may be further apart '
                        'than this.')
 
-
-f = HFile(args.output_file, 'w')
-
 # NORMALIZING FLOW
 
 # Here we generate samples in a similar method to the histogram approach
@@ -189,7 +188,7 @@ if args.use_normalizing_flow:
     nsamples = 0
     all_keys = []
     
-    while len(all_keys) <= args.nf_epochs:
+    while len(all_keys) <= args.nf_samples:
         nsamples += size
         logging.info('generating %s samples', size)
         # Choose random sky location and polarizations from
@@ -291,7 +290,7 @@ if args.use_normalizing_flow:
     # Training the Normalizing Flow. Increasing the training paramaters should
     # improve performance at th eexpense of some increased cost.    
     flow = NormalizingFlow(n_dims, bounds=bounds, n_neurons=args.nf_neurons, num_bins=args.nf_bins)
-    history = flow.fit(data_array, n_samples=args.nf_epochs)
+    history = flow.fit(data_array, n_samples=args.nf_samples, n_epochs=args.nf_epochs)
 
     # Storing the maximum probability from our training samples.
     hist_max = max(flow.prob(data_array))
@@ -299,11 +298,12 @@ if args.use_normalizing_flow:
     ml_stat = MLStatistic(
         model=flow, 
         metadata={
-            "stat": "phasetdNF_newsnr_%s" % ''.join(args.ifos), 
             "hist_max": hist_max
         }
     )
-    ml_stat.to_file(f.filename, group_name="model")
+    ml_stat.to_file(args.output_file, group_name="model")
+    f = HFile(args.output_file, "a")
+
     logging.info('Done training Flow model.')
 
 
@@ -314,6 +314,7 @@ if args.use_normalizing_flow:
 # symmetries handled under ifo switch and apply more consistent treatment
 # of error uncertainties.
 else:
+    f = HFile(args.output_file, 'w')
     logging.info('Generating Samples for Histogram File')
     for ifo0 in args.ifos:
         logging.info('Storing results using %s as a reference', ifo0)
