@@ -106,8 +106,12 @@ class Stat(object):
             if key.startswith("sngl_ranking_"):
                 ranking_key = key[13:]
 
-                if ranking_key == "harmonic_stats_file":
-                    # Keep the filename as a string
+                if ranking_key in [
+                    "harmonic_stats_file",
+                    "conditional_flow_file",
+                    "template_bank_file",
+                ]:
+                    # Keep filenames as strings
                     self.sngl_ranking_kwargs[ranking_key] = value
                 else:
                     # Existing numerical ranking options remain floats

@@ -248,7 +248,6 @@ def template_triggers(t_num):
         if template is None:
             template_comps = bank.get(t_num, stilde.psd)
             max_comps = len([a for a in template_comps if a is not None])
-            bank_num_comps = template_comps[0].bank_num_comps
             tparam = template_comps[0].params
 
         if opt.update_progress:
@@ -264,7 +263,7 @@ def template_triggers(t_num):
                                                      cluster_window,
                                                      epoch=stilde._epoch,
                                                      num_comps=max_comps,
-                                                     bank_num_comps=bank_num_comps,)
+                                                     )
         if not len(idx):
             continue
         if inj_filter_rejector.enabled:

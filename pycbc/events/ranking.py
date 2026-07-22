@@ -4,11 +4,14 @@ statistic values
 import logging
 import numpy
 import h5py
+from .ml_stat_conditional import MLStatistic
 
 logger = logging.getLogger('pycbc.events.ranking')
 
 # Cache harmonic statistics so the HDF file is only read once
 _harmonic_stats_cache = {}
+_conditional_flow_cache = {}
+_template_conditions_cache = {}
 
 
 def _load_harmonic_stats(harmonic_stats_file):
@@ -95,11 +98,142 @@ def mahalanobis_weighted_snr(
 
         d_squared = numpy.maximum(d_squared, 0.0)
         weights = numpy.ones_like(snr)
-        print(d_squared)
-        mask = numpy.sqrt(d_squared) > distance_threshold
-        weights[mask] = numpy.exp(-0.5 * d_squared[mask])
+        weights = -0.5 * d_squared
 
-        return snr * weights
+        return snr + weights
+
+def _load_conditional_flow(flow_file):
+    """Load and cache the conditional normalizing flow."""
+    if flow_file not in _conditional_flow_cache:
+        _conditional_flow_cache[flow_file] = MLStatistic.from_file(flow_file)
+
+    return _conditional_flow_cache[flow_file]
+
+
+def _load_template_conditions(bank_file):
+    """Load and cache the conditional parameters for every template."""
+    if bank_file not in _template_conditions_cache:
+        with h5py.File(bank_file, "r") as f:
+            conditions = numpy.column_stack([
+                f["mass1"][:],
+                f["mass2"][:],
+                f["spin1x"][:],
+                f["spin1y"][:],
+                f["spin1z"][:],
+                f["spin2x"][:],
+                f["spin2y"][:],
+                f["spin2z"][:],
+            ]).astype(numpy.float64)
+
+        _template_conditions_cache[bank_file] = conditions
+
+    return _template_conditions_cache[bank_file]
+
+
+def conditional_flow_weighted_snr(
+        trigs,
+        conditional_flow,
+        template_conditions,
+        **kwargs):
+    """
+    Add the conditional-flow log probability of the harmonic ratios
+    to the trigger SNR.
+    """
+
+    def get_field(name):
+        try:
+            return numpy.asarray(trigs[name])
+        except (KeyError, TypeError, IndexError):
+            return numpy.asarray(getattr(trigs, name))
+
+    snr = numpy.array(
+        get_field("snr"),
+        ndmin=1,
+        dtype=numpy.float64
+    )
+
+    comp1 = numpy.array(
+        get_field("snr_comp_1"),
+        ndmin=1,
+        dtype=numpy.float64
+    )
+    comp2 = numpy.array(
+        get_field("snr_comp_2"),
+        ndmin=1,
+        dtype=numpy.float64
+    )
+    comp3 = numpy.array(
+        get_field("snr_comp_3"),
+        ndmin=1,
+        dtype=numpy.float64
+    )
+
+    try:
+        template_ids = numpy.array(
+            get_field("template_id"),
+            ndmin=1,
+            dtype=numpy.int64
+        )
+    except (KeyError, AttributeError, TypeError, IndexError):
+        template_ids = numpy.array(
+            get_field("template_num"),
+            ndmin=1,
+            dtype=numpy.int64
+        )
+
+    # ReadByTemplate may provide one template number for all triggers
+    if template_ids.size == 1 and snr.size > 1:
+        template_ids = numpy.full(
+            snr.shape,
+            template_ids.item(),
+            dtype=numpy.int64
+        )
+
+    if template_ids.size != snr.size:
+        raise ValueError(
+            f"Got {template_ids.size} template IDs for {snr.size} triggers"
+        )
+    print(
+        "Triggers:", snr.size,
+        "Template IDs:", template_ids.size,
+        "Unique templates:", numpy.unique(template_ids).size,
+        flush=True
+    )
+    with numpy.errstate(divide="ignore", invalid="ignore"):
+        ratios = numpy.column_stack([
+            numpy.log(comp2 / comp1),
+            numpy.log(comp3 / comp1),
+        ])
+
+    batch_size = 1000000
+
+    print(
+        "Triggers in this flow call:",
+        len(ratios),
+        flush=True
+    )
+
+    log_prob = numpy.empty(
+        len(ratios),
+        dtype=numpy.float64
+    )
+
+    for start in range(0, len(ratios), batch_size):
+        end = min(start + batch_size, len(ratios))
+
+        batch_conditions = numpy.asarray(
+            template_conditions[template_ids[start:end]],
+            dtype=numpy.float64
+        )
+
+        log_prob[start:end] = conditional_flow.log_prob(
+            ratios[start:end],
+            conditional=batch_conditions
+        )
+
+    log_prob[~numpy.isfinite(log_prob)] = -numpy.inf
+
+    return snr + log_prob
 
 def effsnr(snr, reduced_x2, fac=250.,
            **kwargs):  # pylint:disable=unused-argument
@@ -476,6 +610,58 @@ def get_newsnr_sgveto_psdvar_threshold_mahalanobis(
         dtype=numpy.float32
     )
 
+def get_newsnr_sgveto_psdvar_threshold_conditional_flow(
+        trigs,
+        conditional_flow_file=None,
+        template_bank_file=None,
+        **kwargs):
+    """
+    Calculate newsnr with the conditional normalizing-flow log probability
+    added to the SNR before the standard chi-squared, SG-veto and PSD
+    variation reweighting.
+    """
+
+    if conditional_flow_file is None:
+        raise ValueError(
+            "newsnr_sgveto_psdvar_threshold_conditional_flow requires "
+            "conditional_flow_file"
+        )
+
+    if template_bank_file is None:
+        raise ValueError(
+            "newsnr_sgveto_psdvar_threshold_conditional_flow requires "
+            "template_bank_file"
+        )
+
+    conditional_flow = _load_conditional_flow(
+        conditional_flow_file
+    )
+
+    template_conditions = _load_template_conditions(
+        template_bank_file
+    )
+
+    weighted_snr = conditional_flow_weighted_snr(
+        trigs,
+        conditional_flow=conditional_flow,
+        template_conditions=template_conditions
+    )
+
+    dof = 2. * trigs["chisq_dof"][:] - 2.
+
+    nsnr_sg_psdt = newsnr_sgveto_psdvar_threshold(
+        weighted_snr,
+        trigs["chisq"][:] / dof,
+        trigs["sg_chisq"][:],
+        trigs["psd_var_val"][:],
+        **kwargs
+    )
+
+    return numpy.array(
+        nsnr_sg_psdt,
+        ndmin=1,
+        dtype=numpy.float32
+    )
 
 sngls_ranking_function_dict = {
     'snr': get_snr,
@@ -489,6 +675,8 @@ sngls_ranking_function_dict = {
     get_newsnr_sgveto_psdvar_scaled_threshold,
     'newsnr_sgveto_psdvar_threshold_mahalanobis':
     get_newsnr_sgveto_psdvar_threshold_mahalanobis,
+    'newsnr_sgveto_psdvar_threshold_conditional_flow':
+    get_newsnr_sgveto_psdvar_threshold_conditional_flow,
 }
 
 # Lists of datasets required in the trigs object for each function
@@ -507,6 +695,14 @@ reqd_datasets['newsnr_sgveto_psdvar_scaled_threshold'] = \
     reqd_datasets['newsnr_sgveto_psdvar']
 reqd_datasets['newsnr_sgveto_psdvar_threshold_mahalanobis'] = \
     reqd_datasets['newsnr_sgveto_psdvar_threshold'] + [
+        'snr_comp_1',
+        'snr_comp_2',
+        'snr_comp_3',
+        'template_id'
+    ]
+reqd_datasets[
+        'newsnr_sgveto_psdvar_threshold_conditional_flow'
+    ] = reqd_datasets['newsnr_sgveto_psdvar_threshold'] + [
         'snr_comp_1',
         'snr_comp_2',
         'snr_comp_3',

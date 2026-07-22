@@ -1093,7 +1093,7 @@ class MatchedFilterTHAControl(object):
         else:
             self.snr_mem.data[:] += squared_norm(self.snr_mem_comps[i])
 
-    def tha_matched_filter_and_cluster(self, segnum, template_norm, window, epoch=None, num_comps=5, bank_num_comps=5):
+    def tha_matched_filter_and_cluster(self, segnum, template_norm, window, epoch=None, num_comps=5):
         """ Returns the complex snr timeseries, normalization of the complex snr,
         the correlation vector frequency series, the list of indices of the
         triggers, and the snr values at the trigger locations. Returns empty
@@ -1125,12 +1125,11 @@ class MatchedFilterTHAControl(object):
             The snr values at the trigger locations.
         """
         logging.info("Using %d comps" % num_comps)
-        norm = (4.0 * self.delta_f)
+        norm = 4.0 * self.delta_f
 
         from pycbc.types.array_cpu import squared_norm
 
         self.snr_mem.clear()
-        self.snr_mem_cluster.clear()
 
         for i in range(num_comps):
             self.run_correlators(segnum, i)
@@ -1138,70 +1137,73 @@ class MatchedFilterTHAControl(object):
 
             comp_snrsq = squared_norm(self.snr_mem_comps[i])
 
-            # if not numpy.all(numpy.isfinite(comp_snrsq)):
-            #     bad_idx = numpy.where(~numpy.isfinite(comp_snrsq))[0]
-
-            #     raise ValueError(
-            #         f"Non-finite SNR^2 found in harmonic {i + 1}. "
-            #         f"Number of bad samples: {len(bad_idx)}. "
-            #         f"First bad indices: {bad_idx[:10]}"
-            #     )
-
-            # Full optimal SNR^2 (all filtered harmonics)
+            # Save harmonic 1 SNR^2 for thresholding
             if i == 0:
                 self.snr_mem.data[:] = comp_snrsq
                 self.first_harm_thresh.data[:] = comp_snrsq
             else:
+                # Full optimal SNR^2 summed over all filtered harmonics
                 self.snr_mem.data[:] += comp_snrsq
-
-            # SNR^2 used for clustering (only up to bank_num_comps)
-            if i < bank_num_comps:
-                self.snr_mem_cluster.data[:] += comp_snrsq
 
         thresh = self.snr_threshold[0]
 
-        # Find all samples where harmonic 1 exceeds threshold
+        # Threshold using harmonic 1 only
         idx, _ = events.threshold_only(
-        self.first_harm_thresh[self.segments[segnum].analyze],
-        (thresh / norm)**2
+            self.first_harm_thresh[self.segments[segnum].analyze],
+            (thresh / norm) ** 2
         )
 
         if len(idx) == 0:
             return [], [], [], [], [], []
 
-        # Full indices for looking up values in the complete timeseries
+        # Convert analysis-slice indices to full timeseries indices
         idx_full = idx + self.segments[segnum].analyze.start
 
-        # SNR^2 used ONLY for deciding which sample survives clustering.
-        # This contains the sum over the first bank_num_comps harmonics.
-        cluster_snrsq = self.snr_mem_cluster[idx_full]
+        # Cluster using the full optimal SNR^2
+        cluster_snrsq = self.snr_mem[idx_full]
 
-        # Cluster using the bank_num_comps SNR^2
-        idx, _ = events.cluster_reduce(idx, cluster_snrsq, window)
+        idx, _ = events.cluster_reduce(
+            idx,
+            cluster_snrsq,
+            window
+        )
 
         if len(idx) == 0:
             return [], [], [], [], [], []
 
-        # Get full-timeseries indices of the surviving clustered triggers
         idx_full = idx + self.segments[segnum].analyze.start
 
-        # Returned/saved SNR is the quadrature sum over ALL filtered harmonics
-        snrv = self.snr_mem[idx_full]**0.5  
-
-        if len(idx) == 0:
-            return [], [], [], [], [], []
+        # Return full optimal SNR
+        snrv = self.snr_mem[idx_full] ** 0.5
 
         logging.info("%s points above threshold" % str(len(idx)))
 
-        snrsq_full = TimeSeries(self.snr_mem, epoch=epoch, delta_t=self.delta_t, copy=False)
+        snrsq_full = TimeSeries(
+            self.snr_mem,
+            epoch=epoch,
+            delta_t=self.delta_t,
+            copy=False
+        )
+
         snrs = [
-            TimeSeries(self.snr_mem_comps[i], epoch=epoch, delta_t=self.delta_t, copy=False)
-            if i < num_comps else None for i in range(5)
+            TimeSeries(
+                self.snr_mem_comps[i],
+                epoch=epoch,
+                delta_t=self.delta_t,
+                copy=False
+            ) if i < num_comps else None
+            for i in range(5)
         ]
+
         corrs = [
-            FrequencySeries(self.corr_mem_comps[i], delta_f=self.delta_f, copy=False)
-            if i < num_comps else None for i in range(5)
+            FrequencySeries(
+                self.corr_mem_comps[i],
+                delta_f=self.delta_f,
+                copy=False
+            ) if i < num_comps else None
+            for i in range(5)
         ]
+
         return snrsq_full, norm, corrs, snrs, idx, snrv
 
 
