@@ -107,7 +107,7 @@ def mahalanobis_weighted_snr(
 def _load_conditional_flow(flow_file):
     """Load and cache the conditional normalizing flow."""
     if flow_file not in _conditional_flow_cache:
-        _conditional_flow_cache[flow_file] = MLStatistic.from_file(flow_file)
+        _conditional_flow_cache[flow_file] = MLStatistic.from_file(flow_file, device = "cpu")
 
     return _conditional_flow_cache[flow_file]
 
@@ -133,7 +133,7 @@ def _load_template_beta(bank_file):
             ],
         )
 
-        beta = numpy.empty(len(bank), dtype=numpy.float64)
+        beta = numpy.empty(len(bank), dtype=numpy.float32)
 
         for index, template in enumerate(bank.table):
             beta_template = SimpleNamespace(
@@ -189,14 +189,14 @@ def conditional_flow_weighted_snr(
     snr = numpy.array(
         get_field("snr"),
         ndmin=1,
-        dtype=numpy.float64
+        dtype=numpy.float32
     )
 
     components = [
         numpy.array(
             get_field(f"snr_comp_{index}"),
             ndmin=1,
-            dtype=numpy.float64
+            dtype=numpy.float32
         )
         for index in range(1, num_comps + 1)
     ]
@@ -206,7 +206,7 @@ def conditional_flow_weighted_snr(
             components[index - 1] = numpy.full(
                 snr.shape,
                 component.item(),
-                dtype=numpy.float64
+                dtype=numpy.float32
             )
         elif component.size != snr.size:
             raise ValueError(
@@ -241,20 +241,21 @@ def conditional_flow_weighted_snr(
         )
 
     comp1 = components[0]
+
     with numpy.errstate(divide="ignore", invalid="ignore"):
         ratios = numpy.column_stack([
             numpy.log(component / comp1)
             for component in components[1:]
-        ])
+        ]).astype(numpy.float32, copy=False)
 
-    log_prob = numpy.empty(len(ratios), dtype=numpy.float64)
+    log_prob = numpy.empty(len(ratios), dtype=numpy.float32)
 
     for start in range(0, len(ratios), batch_size):
         end = min(start + batch_size, len(ratios))
 
         batch_conditions = numpy.asarray(
             template_beta[template_ids[start:end]],
-            dtype=numpy.float64
+            dtype=numpy.float32
         )
 
         log_prob[start:end] = conditional_flow.log_prob(

@@ -5,7 +5,7 @@ from typing import Type
 import h5py
 import torch
 import tqdm
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float32)
 logger = logging.getLogger("pycbc.events.ml_stat")
 
 
@@ -424,7 +424,7 @@ class NormalizingFlow(MLModel):
             w.create_dataset(k, data=np.atleast_1d(v.cpu().numpy()))
 
     @classmethod
-    def from_hdf5(cls, h5py_file: h5py.File, group_name: str = "model", load_weights: bool = True) -> "NormalizingFlow":
+    def from_hdf5(cls, h5py_file: h5py.File, group_name: str = "model", load_weights: bool = True, device = None) -> "NormalizingFlow":
         """Load from a file.
         Load a model from an h5 file. See `to_file` for file structure.
         Parameters
@@ -443,6 +443,8 @@ class NormalizingFlow(MLModel):
         f = h5py_file[group_name]
         assert f.attrs["model_class"] == cls.__name__
         flow_kwargs = dict(f["config"].attrs)
+        if device is not None:
+            flow_kwargs["device"] = device
         logger.info(f"Loading model with config: {flow_kwargs}")
         model = cls(**flow_kwargs)
         if load_weights:
