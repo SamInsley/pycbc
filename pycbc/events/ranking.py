@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import numpy
 import h5py
 from .ml_stat_conditional import MLStatistic
-from pycbc.waveform.bank import TemplateBank, compute_beta
 
 logger = logging.getLogger('pycbc.events.ranking')
 
@@ -116,12 +115,27 @@ def _load_conditional_flow(flow_file):
 def _load_template_beta(bank_file):
     """Calculate, fold and cache beta for every template in the bank."""
     if bank_file not in _template_beta_cache:
-        bank = TemplateBank(bank_file)
+        # Import lazily to avoid a circular import while pycbc.events loads.
+        from pycbc.waveform.bank import TemplateBank, compute_beta
+
+        bank = TemplateBank(
+            bank_file,
+            parameters=[
+                "mass1",
+                "mass2",
+                "spin1x",
+                "spin1y",
+                "spin1z",
+                "spin2x",
+                "spin2y",
+                "spin2z",
+                "f_lower",
+            ],
+        )
+
         beta = numpy.empty(len(bank), dtype=numpy.float64)
 
         for index, template in enumerate(bank.table):
-            # compute_beta expects the low-frequency cutoff as ``flow``,
-            # while template-bank rows store it as ``f_lower``.
             beta_template = SimpleNamespace(
                 mass1=template.mass1,
                 mass2=template.mass2,
@@ -133,14 +147,15 @@ def _load_template_beta(bank_file):
                 spin2z=template.spin2z,
                 flow=template.f_lower,
             )
+
             beta[index] = compute_beta(beta_template)
 
-        # Fold beta about pi / 2 so the condition lies in [0, pi / 2].
         beta = numpy.where(
             beta > numpy.pi / 2.0,
             numpy.pi - beta,
-            beta
+            beta,
         )
+
         _template_beta_cache[bank_file] = beta[:, None]
 
     return _template_beta_cache[bank_file]
