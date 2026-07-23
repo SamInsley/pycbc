@@ -176,7 +176,8 @@ def conditional_flow_weighted_snr(
     ``log(snr_comp_i / snr_comp_1)`` for harmonics 2 through ``num_comps``.
     The condition is the folded template beta value.
     """
-
+    num_comps = int(num_comps)
+    batch_size = int(batch_size)
     def get_field(name):
         try:
             return numpy.asarray(trigs[name])
