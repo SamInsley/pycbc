@@ -2,16 +2,19 @@
 statistic values
 """
 import logging
+from types import SimpleNamespace
+
 import numpy
 import h5py
 from .ml_stat_conditional import MLStatistic
+from pycbc.waveform.bank import TemplateBank, compute_beta
 
 logger = logging.getLogger('pycbc.events.ranking')
 
 # Cache harmonic statistics so the HDF file is only read once
 _harmonic_stats_cache = {}
 _conditional_flow_cache = {}
-_template_conditions_cache = {}
+_template_beta_cache = {}
 
 
 def _load_harmonic_stats(harmonic_stats_file):
@@ -110,34 +113,53 @@ def _load_conditional_flow(flow_file):
     return _conditional_flow_cache[flow_file]
 
 
-def _load_template_conditions(bank_file):
-    """Load and cache the conditional parameters for every template."""
-    if bank_file not in _template_conditions_cache:
-        with h5py.File(bank_file, "r") as f:
-            conditions = numpy.column_stack([
-                f["mass1"][:],
-                f["mass2"][:],
-                f["spin1x"][:],
-                f["spin1y"][:],
-                f["spin1z"][:],
-                f["spin2x"][:],
-                f["spin2y"][:],
-                f["spin2z"][:],
-            ]).astype(numpy.float64)
+def _load_template_beta(bank_file):
+    """Calculate, fold and cache beta for every template in the bank."""
+    if bank_file not in _template_beta_cache:
+        bank = TemplateBank(bank_file)
+        beta = numpy.empty(len(bank), dtype=numpy.float64)
 
-        _template_conditions_cache[bank_file] = conditions
+        for index, template in enumerate(bank.table):
+            # compute_beta expects the low-frequency cutoff as ``flow``,
+            # while template-bank rows store it as ``f_lower``.
+            beta_template = SimpleNamespace(
+                mass1=template.mass1,
+                mass2=template.mass2,
+                spin1x=template.spin1x,
+                spin1y=template.spin1y,
+                spin1z=template.spin1z,
+                spin2x=template.spin2x,
+                spin2y=template.spin2y,
+                spin2z=template.spin2z,
+                flow=template.f_lower,
+            )
+            beta[index] = compute_beta(beta_template)
 
-    return _template_conditions_cache[bank_file]
+        # Fold beta about pi / 2 so the condition lies in [0, pi / 2].
+        beta = numpy.where(
+            beta > numpy.pi / 2.0,
+            numpy.pi - beta,
+            beta
+        )
+        _template_beta_cache[bank_file] = beta[:, None]
+
+    return _template_beta_cache[bank_file]
 
 
 def conditional_flow_weighted_snr(
         trigs,
         conditional_flow,
-        template_conditions,
+        template_beta,
+        num_comps=3,
+        batch_size=1000000,
         **kwargs):
     """
-    Add the conditional-flow log probability of the harmonic ratios
+    Add the beta-conditional flow log probability of the harmonic ratios
     to the trigger SNR.
+
+    The flow sample has ``num_comps - 1`` entries:
+    ``log(snr_comp_i / snr_comp_1)`` for harmonics 2 through ``num_comps``.
+    The condition is the folded template beta value.
     """
 
     def get_field(name):
@@ -146,27 +168,36 @@ def conditional_flow_weighted_snr(
         except (KeyError, TypeError, IndexError):
             return numpy.asarray(getattr(trigs, name))
 
+    if num_comps < 2:
+        raise ValueError("num_comps must be at least 2")
+
     snr = numpy.array(
         get_field("snr"),
         ndmin=1,
         dtype=numpy.float64
     )
 
-    comp1 = numpy.array(
-        get_field("snr_comp_1"),
-        ndmin=1,
-        dtype=numpy.float64
-    )
-    comp2 = numpy.array(
-        get_field("snr_comp_2"),
-        ndmin=1,
-        dtype=numpy.float64
-    )
-    comp3 = numpy.array(
-        get_field("snr_comp_3"),
-        ndmin=1,
-        dtype=numpy.float64
-    )
+    components = [
+        numpy.array(
+            get_field(f"snr_comp_{index}"),
+            ndmin=1,
+            dtype=numpy.float64
+        )
+        for index in range(1, num_comps + 1)
+    ]
+
+    for index, component in enumerate(components, start=1):
+        if component.size == 1 and snr.size > 1:
+            components[index - 1] = numpy.full(
+                snr.shape,
+                component.item(),
+                dtype=numpy.float64
+            )
+        elif component.size != snr.size:
+            raise ValueError(
+                f"Got {component.size} values for snr_comp_{index} "
+                f"and {snr.size} triggers"
+            )
 
     try:
         template_ids = numpy.array(
@@ -181,7 +212,7 @@ def conditional_flow_weighted_snr(
             dtype=numpy.int64
         )
 
-    # ReadByTemplate may provide one template number for all triggers
+    # ReadByTemplate may provide one template number for all triggers.
     if template_ids.size == 1 and snr.size > 1:
         template_ids = numpy.full(
             snr.shape,
@@ -193,36 +224,21 @@ def conditional_flow_weighted_snr(
         raise ValueError(
             f"Got {template_ids.size} template IDs for {snr.size} triggers"
         )
-    print(
-        "Triggers:", snr.size,
-        "Template IDs:", template_ids.size,
-        "Unique templates:", numpy.unique(template_ids).size,
-        flush=True
-    )
+
+    comp1 = components[0]
     with numpy.errstate(divide="ignore", invalid="ignore"):
         ratios = numpy.column_stack([
-            numpy.log(comp2 / comp1),
-            numpy.log(comp3 / comp1),
+            numpy.log(component / comp1)
+            for component in components[1:]
         ])
 
-    batch_size = 1000000
-
-    print(
-        "Triggers in this flow call:",
-        len(ratios),
-        flush=True
-    )
-
-    log_prob = numpy.empty(
-        len(ratios),
-        dtype=numpy.float64
-    )
+    log_prob = numpy.empty(len(ratios), dtype=numpy.float64)
 
     for start in range(0, len(ratios), batch_size):
         end = min(start + batch_size, len(ratios))
 
         batch_conditions = numpy.asarray(
-            template_conditions[template_ids[start:end]],
+            template_beta[template_ids[start:end]],
             dtype=numpy.float64
         )
 
@@ -614,6 +630,8 @@ def get_newsnr_sgveto_psdvar_threshold_conditional_flow(
         trigs,
         conditional_flow_file=None,
         template_bank_file=None,
+        num_comps=3,
+        batch_size=1000000,
         **kwargs):
     """
     Calculate newsnr with the conditional normalizing-flow log probability
@@ -637,14 +655,16 @@ def get_newsnr_sgveto_psdvar_threshold_conditional_flow(
         conditional_flow_file
     )
 
-    template_conditions = _load_template_conditions(
+    template_beta = _load_template_beta(
         template_bank_file
     )
 
     weighted_snr = conditional_flow_weighted_snr(
         trigs,
         conditional_flow=conditional_flow,
-        template_conditions=template_conditions
+        template_beta=template_beta,
+        num_comps=num_comps,
+        batch_size=batch_size
     )
 
     dof = 2. * trigs["chisq_dof"][:] - 2.
@@ -706,6 +726,8 @@ reqd_datasets[
         'snr_comp_1',
         'snr_comp_2',
         'snr_comp_3',
+        'snr_comp_4',
+        'snr_comp_5',
         'template_id'
     ]
 
