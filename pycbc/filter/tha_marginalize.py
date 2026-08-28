@@ -316,18 +316,34 @@ def fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc, dpsi, weights_ta, n_psi):
     return M.reshape(-1, 5), hh.reshape(-1), ln_weight.reshape(-1)
 
 
-def marginalize_for_psd(template_grid, psd, z, n_psi=16, lookup_table=None):
+def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, lookup_table=None):
     """
     All-in-one per-segment call: given a template's PSD-independent grid
-    data (as returned by one entry of ``load_raw_grid_file``) and the
-    segment's actual PSD, cheaply re-derive the orientation/psi grid for
-    that PSD and marginalize the given snr_comp_1..5 sample(s).
+    data (as returned by one entry of ``load_raw_grid_file``, MINUS the
+    raw harmonics -- see below), the raw harmonics themselves (obtained
+    live, from the same waveform generation the ordinary matched-filter
+    stage already performs -- see bank.py's whitening/orthogonalization
+    step -- rather than from the (now-removed) 'raws' entry of the grid
+    file), and the segment's actual PSD, cheaply re-derive the
+    orientation/psi grid for that PSD and marginalize the given
+    snr_comp_1..5 sample(s).
 
     Parameters
     ----------
     template_grid : dict
         One value from the dict returned by ``load_raw_grid_file``, with
-        keys 'raws', 'A', 'B', 'dpsi', 'weights_ta'.
+        keys 'A', 'B', 'dpsi', 'weights_ta' -- NOT 'raws' (see raws
+        below). The grid file no longer stores 'raws' at all, to avoid
+        the prohibitive per-template storage cost of the full raw
+        harmonic frequency series (see THA_MARG_INFO.md).
+    raws : list of 5 (n_freq,) complex arrays
+        The raw (unwhitened, unnormalized) harmonic waveforms for this
+        template, in reverse_flag-adjusted order -- obtained live from
+        the SAME waveform generation already performed for ordinary
+        matched filtering (bank.py's compute_waveform_five_comps,
+        called before whitening/orthogonalization discards them), not
+        from a separately stored/precomputed file. See
+        bank.py's raw_comps caching for where these come from.
     psd : (n_freq,) float array
     z : (5,) or (5, n_time) complex array
         snr_comp_1..5.
@@ -340,7 +356,7 @@ def marginalize_for_psd(template_grid, psd, z, n_psi=16, lookup_table=None):
     lnl_marg : float or (n_time,) float array
     """
     Ep, Ec, hh_pp, hh_cc, hh_pc = derive_ep_ec_hh(
-        template_grid['raws'], template_grid['A'], template_grid['B'],
+        raws, template_grid['A'], template_grid['B'],
         psd, template_grid['df'], template_grid['kmin'], template_grid['kmax'])
     M, hh, ln_weight = fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc,
                                 template_grid['dpsi'], template_grid['weights_ta'],
@@ -357,22 +373,30 @@ def load_raw_grid_file(path):
     Returns
     -------
     grid_by_hash : dict
-        Maps int(template_hash) -> dict with keys 'raws' (list of 5
-        complex arrays), 'A', 'B' ((n_grid, 5) complex arrays), 'dpsi'
-        ((n_grid,) float array), 'weights_ta' ((n_grid,) float array),
-        'df', 'kmin', 'kmax' (shared metadata, duplicated per template
-        for convenience).
+        Maps int(template_hash) -> dict with keys 'A', 'B'
+        ((n_grid, 5) complex arrays), 'dpsi' ((n_grid,) float array),
+        'weights_ta' ((n_grid,) float array), 'df', 'kmin', 'kmax'
+        (shared metadata, duplicated per template for convenience).
+        Does NOT include 'raws' -- the raw harmonics are obtained live,
+        at actual filtering time, from bank.py's own already-cached
+        template.h1..h5 (see marginalize_for_psd's raws argument and
+        pycbc_inspiral_tha's template_triggers), rather than being
+        precomputed and stored here, since storing the full-resolution
+        raw harmonic frequency series per template was the dominant
+        (>99%) contributor to grid file size for a full bank.
     """
     grid_by_hash = {}
     with h5py.File(path, 'r') as f:
         df = float(f.attrs['df'])
         kmin = int(f.attrs['kmin'])
         kmax = int(f.attrs['kmax'])
-        theta_grid = f['theta_grid'][:]
-        alpha_grid = f['alpha_grid'][:]
-        weights_ta = f['weights_ta'][:]
+        # theta_grid/alpha_grid/weights_ta are not template-dependent --
+        # stored as file-level attrs rather than datasets (see
+        # pycbc_make_tha_marginalization_grid).
+        theta_grid = np.asarray(f.attrs['theta_grid'])
+        alpha_grid = np.asarray(f.attrs['alpha_grid'])
+        weights_ta = np.asarray(f.attrs['weights_ta'])
         template_hash = f['template_hash'][:]
-        raws_all = f['raws'][:]      # (n_templates, 5, n_freq) complex
         A_all = f['A'][:]            # (n_templates, n_grid, 5) complex
         B_all = f['B'][:]
         beta_all = f['beta'][:]      # (n_templates,) float
@@ -380,7 +404,6 @@ def load_raw_grid_file(path):
         for i, h in enumerate(template_hash):
             dpsi = _dpsi_grid(theta_grid, alpha_grid, beta_all[i])
             grid_by_hash[int(h)] = dict(
-                raws=[raws_all[i, k] for k in range(5)],
                 A=A_all[i], B=B_all[i], dpsi=dpsi, weights_ta=weights_ta,
                 df=df, kmin=kmin, kmax=kmax)
     return grid_by_hash

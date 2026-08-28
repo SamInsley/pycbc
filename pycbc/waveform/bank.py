@@ -1344,13 +1344,43 @@ class _PhenomTemplate():
             lalsim.SimInspiralWaveformParamsInsertPhenomXPrecVersion(LALparams, 320)
             lalsim.SimInspiralWaveformParamsInsertPhenomXPFinalSpinMod(LALparams, 2)
 
-        # generate hp, hc for given orientation with lalsimulation
-        return lalsim.SimInspiralFD(
-            self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x, spin1y,
-            spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI, iota, phi0,
-            0, 0, 0, df, self.flow, f_final, self.fref, LALparams,
-            lalsim.GetApproximantFromString(self.approximant)
-        )
+        # A minority of (template, orientation) combinations hit an
+        # internal GSL interpolation domain error in SimInspiralFD at
+        # the requested df -- generating at a finer df (i.e. a longer
+        # time-domain duration) avoids it. Retry at df/2, df/4, ... df/16
+        # before giving up; the caller is responsible for decimating the
+        # result back down to the originally requested df using the
+        # returned denom.
+        hp = hc = None
+        denom = 1
+        for denom in (1, 2, 4, 8, 16):
+            try:
+                hp, hc = lalsim.SimInspiralFD(
+                    self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x,
+                    spin1y, spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI,
+                    iota, phi0, 0, 0, 0, df/denom, self.flow, f_final,
+                    self.fref, LALparams,
+                    lalsim.GetApproximantFromString(self.approximant)
+                )
+                break
+            except RuntimeError:
+                continue
+
+        if hp is None:
+            # Nothing at any df worked -- fall back once more at the
+            # original df, dropping the flag-based Euler-angle overrides
+            # above (reverts to standard MSA precession angles), as a
+            # last resort. Let any failure here propagate normally.
+            denom = 1
+            LALparams = lal.CreateDict()
+            hp, hc = lalsim.SimInspiralFD(
+                self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x,
+                spin1y, spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI,
+                iota, phi0, 0, 0, 0, df, self.flow, f_final, self.fref,
+                LALparams, lalsim.GetApproximantFromString(self.approximant)
+            )
+
+        return hp, hc, denom
 
     # How much extra time to allow for ringdown, and safety margin because
     # duration estimation can be bad, when picking the coarse df_min used
@@ -1373,9 +1403,23 @@ class _PhenomTemplate():
         new = FrequencySeries(data[:], delta_f=df, epoch=epoch, copy=False)
         return new.cyclic_time_shift(new.end_time)
 
+    @staticmethod
+    def _decimate_to_target_df(series, denom):
+        """If gen_hp_hc had to retry at a finer df (see its docstring
+        comment on the retry-at-finer-df strategy), `series` was built at
+        df*denom's reciprocal (i.e. a finer spacing than originally
+        requested). Downsample by `denom` back down to the originally
+        requested df. No-op if denom == 1."""
+        if denom == 1:
+            return series
+        return FrequencySeries(series.data[::denom].copy(),
+                                delta_f=series.delta_f * denom,
+                                epoch=series.epoch, copy=False)
+
     def gen_harmonics_comp(self, thetaJN, alpha0, phi0, psi, df, f_final):
-        # generate hp, hc
-        hp, hc = self.gen_hp_hc(thetaJN, alpha0, phi0, df, f_final)
+        # generate hp, hc (denom > 1 if gen_hp_hc had to retry at a finer
+        # df -- see its docstring comment)
+        hp, hc, denom = self.gen_hp_hc(thetaJN, alpha0, phi0, df, f_final)
         # 1908.05707 defines psi in J-aligned frame. Need to rotate to
         # L-aligned frame and multiply by w+, wx
         dpsi = _dpsi(thetaJN, alpha0, self.beta)
@@ -1386,8 +1430,10 @@ class _PhenomTemplate():
         # L-aligned frame
         h *= np.exp(2j * _dphi(thetaJN, alpha0, self.beta))
         # create LAL frequency array and return precessing harmonic,
-        # correcting Phenom's FD merger-placement convention
-        return self._shift_convention(h, hp.epoch, df)
+        # correcting Phenom's FD merger-placement convention. hp/hc were
+        # generated at df/denom, so decimate back down to the target df.
+        new = self._shift_convention(h, hp.epoch, df / denom)
+        return self._decimate_to_target_df(new, denom)
 
     def get_interp_df_min(self):
         """The coarse delta_f used by the interp=True "generate coarse,
@@ -1599,4 +1645,3 @@ __all__ = ('sigma_cached', 'boolargs_from_apprxstr', 'add_approximant_arg',
            'parse_approximant_arg', 'tuple_to_hash', 'TemplateBank',
            'LiveFilterBank', 'FilterBank', 'find_variable_start_frequency',
            'FilterBankSkyMax', 'FilterBankTHA')
-

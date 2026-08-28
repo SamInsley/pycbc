@@ -1,0 +1,200 @@
+#!/usr/bin/env python
+"""
+Build the auxiliary, PSD-independent marginalization-grid file consumed
+by pycbc_inspiral_tha's --marginalized-grid-file option, for a template
+bank (or a slice of one, for splitting the work across many jobs).
+
+This is a one-time, offline precompute: for each template it generates
+the 5 raw (unwhitened) harmonics and, for a grid of (theta_jn, alpha0)
+orientations, the exact coefficients expressing that orientation's
+h+/hx as linear combinations of the raw harmonics. Both are properties
+of the intrinsic waveform alone; the actual PSD-dependent filters used
+at search time are cheaply re-derived per segment by pycbc_inspiral_tha
+itself (pycbc.filter.tha_marginalize), so this file only needs building
+once and is reused regardless of which PSD(s) the search later
+encounters.
+
+See THA_MARG_INFO.md for the full derivation and rationale.
+"""
+import argparse
+import logging
+import numpy as np
+
+import pycbc
+from pycbc import psd as pycbc_psd
+from pycbc.waveform.bank import TemplateBank, PhenomXPTemplate
+from pycbc.waveform.tha_marg_grid import make_theta_alpha_grid, compute_raw_and_ab
+from pycbc.io import HFile
+
+parser = argparse.ArgumentParser(description=__doc__)
+pycbc.add_common_pycbc_options(parser)
+parser.add_argument('--bank-file', required=True,
+                     help='Template bank HDF5 file (as read by '
+                          'pycbc.waveform.bank.TemplateBank).')
+parser.add_argument('--output', required=True,
+                     help='Output HDF5 file.')
+parser.add_argument('--sample-rate', type=float, required=True,
+                     help='Sample rate (Hz) of the search this grid is '
+                          'being built for. Sets f_final = sample_rate/2 '
+                          'and must match the search for the frequency '
+                          'binning of the cached raw harmonics to line '
+                          'up with the search PSD at filter time.')
+parser.add_argument('--delta-f', type=float, required=True,
+                     help='Frequency resolution (Hz) of the search this '
+                          'grid is being built for (i.e. the same '
+                          'delta_f the search segments will use).')
+parser.add_argument('--low-frequency-cutoff', type=float, required=True)
+parser.add_argument('--n-theta', type=int, default=24,
+                     help='Number of theta_jn grid points (default: 24, '
+                          'the resolution validated against grid-'
+                          'convergence testing; see THA_MARG_INFO.md).')
+parser.add_argument('--n-alpha', type=int, default=24,
+                     help='Number of alpha0 grid points (default: 24).')
+parser.add_argument('--reference-psd-model', default='aLIGOZeroDetHighPower',
+                     help='Analytical PSD (pycbc.psd.analytical) used '
+                          'only as the internal numerical reference for '
+                          'solving the raw-basis expansion coefficients '
+                          'A, B. The result is independent of this '
+                          'choice to the same tolerance as the '
+                          '5-harmonic reconstruction fidelity (typically '
+                          '~1e-7 or better) -- it does NOT need to match '
+                          'the real detector noise, and the grid does '
+                          'not need rebuilding if the real PSD changes.')
+parser.add_argument('--reference-psd-file',
+                     help='Alternative to --reference-psd-model: an '
+                          'ASD/PSD text file (see pycbc.psd.from_txt).')
+parser.add_argument('--start-index', type=int, default=None,
+                     help='First template row index (inclusive) to '
+                          'process, for splitting work across jobs by '
+                          'hand. Mutually exclusive with '
+                          '--num-jobs/--job-index (the recommended way '
+                          'to split a run across many parallel jobs; '
+                          'see THA_MARG_INFO.md). Default: 0.')
+parser.add_argument('--end-index', type=int, default=None,
+                     help='Last template row index (exclusive) to '
+                          'process, for splitting work across jobs by '
+                          'hand. Mutually exclusive with '
+                          '--num-jobs/--job-index. Default: process to '
+                          'the end of the bank.')
+parser.add_argument('--num-jobs', type=int, default=None,
+                     help='Split the bank into this many contiguous, '
+                          'near-equal chunks and process only the one '
+                          'given by --job-index. This is the '
+                          'recommended way to parallelize building a '
+                          'grid file over a full bank across many jobs '
+                          '(e.g. one per HTCondor/Pegasus job); see '
+                          '"Parallelizing" in THA_MARG_INFO.md for the '
+                          'full workflow, including how to combine the '
+                          'resulting per-job files with '
+                          'pycbc_combine_tha_marginalization_grid. '
+                          'Requires --job-index; mutually exclusive '
+                          'with --start-index/--end-index.')
+parser.add_argument('--job-index', type=int, default=None,
+                     help='Which chunk (0-indexed, < --num-jobs) of '
+                          'the bank this job should process. Requires '
+                          '--num-jobs.')
+parser.add_argument('--interp', action='store_true',
+                     help='Generate the 5 raw harmonics and grid-point '
+                          'waveforms using the "interp=True" fast-'
+                          'generation shortcut (bank.py\'s default for '
+                          'the real search filters) instead of direct '
+                          'generation at the target delta_f. This is '
+                          'much cheaper but gives ~1e-4-level (rather '
+                          'than ~1e-14-level) internal reconstruction '
+                          'fidelity -- negligible for search purposes, '
+                          'but not exact. Default: off (direct '
+                          'generation, exact to ~machine precision). '
+                          'See THA_MARG_INFO.md.')
+opt = parser.parse_args()
+
+if (opt.num_jobs is None) != (opt.job_index is None):
+    parser.error('--num-jobs and --job-index must be given together.')
+if opt.num_jobs is not None and (
+        opt.start_index is not None or opt.end_index is not None):
+    parser.error('--num-jobs/--job-index and --start-index/--end-index '
+                  'are mutually exclusive.')
+if opt.num_jobs is not None and not (0 <= opt.job_index < opt.num_jobs):
+    parser.error('--job-index must satisfy 0 <= job-index < num-jobs.')
+
+pycbc.init_logging(opt.verbose)
+
+bank = TemplateBank(opt.bank_file)
+n_templates = len(bank.table)
+
+if opt.num_jobs is not None:
+    # Contiguous, near-equal partition (same scheme as numpy.array_split):
+    # any remainder templates are spread one-per-job across the first
+    # jobs, rather than all dumped on the last one.
+    base, rem = divmod(n_templates, opt.num_jobs)
+    start_index = opt.job_index * base + min(opt.job_index, rem)
+    end_index = start_index + base + (1 if opt.job_index < rem else 0)
+else:
+    start_index = opt.start_index if opt.start_index is not None else 0
+    end_index = opt.end_index if opt.end_index is not None else n_templates
+indices = range(start_index, min(end_index, n_templates))
+
+flen = int(opt.sample_rate / 2. / opt.delta_f) + 1
+kmin = int(opt.low_frequency_cutoff / opt.delta_f)
+kmax = int(opt.sample_rate / 2. / opt.delta_f)
+
+if opt.reference_psd_file:
+    ref_psd = pycbc_psd.from_txt(opt.reference_psd_file, flen, opt.delta_f,
+                                  opt.low_frequency_cutoff)
+else:
+    ref_psd = pycbc_psd.from_string(opt.reference_psd_model, flen, opt.delta_f,
+                                     opt.low_frequency_cutoff)
+
+theta_grid, alpha_grid, weights_ta = make_theta_alpha_grid(opt.n_theta, opt.n_alpha)
+n_grid = len(theta_grid)
+
+template_hash = []
+raws_all = []
+A_all = []
+B_all = []
+beta_all = []
+
+for i in indices:
+    row = bank.table[i]
+    logging.info("Template %d/%d (hash %d)", i, n_templates, row.template_hash)
+    tmpl, raws, A, B = compute_raw_and_ab(
+        row, opt.sample_rate, opt.low_frequency_cutoff, opt.delta_f,
+        opt.sample_rate / 2., theta_grid, alpha_grid, kmin, kmax,
+        ref_psd.data, interp=opt.interp)
+    template_hash.append(int(row.template_hash))
+    raws_all.append(np.array(raws))
+    A_all.append(A)
+    B_all.append(B)
+    beta_all.append(tmpl.beta)
+
+with HFile(opt.output, 'w') as f:
+    f.create_dataset('template_hash', data=np.array(template_hash, dtype=np.int64))
+    f.create_dataset('raws', data=np.array(raws_all, dtype=np.complex64))
+    f.create_dataset('A', data=np.array(A_all, dtype=np.complex128))
+    f.create_dataset('B', data=np.array(B_all, dtype=np.complex128))
+    f.create_dataset('beta', data=np.array(beta_all, dtype=np.float64))
+    f.create_dataset('theta_grid', data=theta_grid)
+    f.create_dataset('alpha_grid', data=alpha_grid)
+    f.create_dataset('weights_ta', data=weights_ta)
+    f.attrs['df'] = opt.delta_f
+    f.attrs['kmin'] = kmin
+    f.attrs['kmax'] = kmax
+    f.attrs['sample_rate'] = opt.sample_rate
+    f.attrs['low_frequency_cutoff'] = opt.low_frequency_cutoff
+    f.attrs['n_theta'] = opt.n_theta
+    f.attrs['n_alpha'] = opt.n_alpha
+    f.attrs['reference_psd_model'] = opt.reference_psd_model or ''
+    f.attrs['start_index'] = start_index
+    f.attrs['end_index'] = end_index
+    # Generation-provenance metadata. sample_rate/df/low_frequency_cutoff
+    # are load-bearing: pycbc_inspiral_tha checks these match its own
+    # configuration before using this file and refuses to run otherwise
+    # (a mismatch here means the frequency binning of `raws` does not
+    # line up with the search's PSD/filters). interp is recorded for
+    # provenance/reproducibility only -- it is not compared against
+    # anything at search time, since pycbc_inspiral_tha's actual filters
+    # always use interp=True with no override (see
+    # pycbc.waveform.tha_marg_grid.get_raw_harmonics docstring).
+    f.attrs['interp'] = opt.interp
+    f.attrs['approximant'] = PhenomXPTemplate.approximant
+
+logging.info("Wrote %d templates to %s", len(template_hash), opt.output)

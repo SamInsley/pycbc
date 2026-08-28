@@ -26,10 +26,16 @@ def _shifted_hp_hc(tmpl, theta_jn, alpha0, phi0, df, f_final):
     """gen_hp_hc, wrapped with the same cyclic time shift bank.py's
     gen_harmonics_comp applies (see compute_raw_and_ab's docstring note
     on why this is needed), reusing _PhenomTemplate's own convention
-    helper rather than reimplementing it."""
-    hp, hc = tmpl.gen_hp_hc(theta_jn, alpha0, phi0, df, f_final)
-    return (tmpl._shift_convention(hp.data.data, hp.epoch, df),
-            tmpl._shift_convention(hc.data.data, hc.epoch, df))
+    helper rather than reimplementing it. gen_hp_hc may have had to
+    retry at a finer df internally (see its docstring comment); denom
+    tells us that and _decimate_to_target_df undoes it, same as
+    gen_harmonics_comp does."""
+    hp, hc, denom = tmpl.gen_hp_hc(theta_jn, alpha0, phi0, df, f_final)
+    hp_fs = tmpl._decimate_to_target_df(
+        tmpl._shift_convention(hp.data.data, hp.epoch, df / denom), denom)
+    hc_fs = tmpl._decimate_to_target_df(
+        tmpl._shift_convention(hc.data.data, hc.epoch, df / denom), denom)
+    return hp_fs, hc_fs
 
 
 def get_interpolated_hp_hc(tmpl, theta_jn, alpha0, phi0, df, f_final):
