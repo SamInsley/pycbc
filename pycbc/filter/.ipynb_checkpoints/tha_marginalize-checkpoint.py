@@ -1,7 +1,10 @@
 """
 Runtime support for the 5-harmonic precessing-search marginalized-SNR
 statistic (marginalizing over sky-orientation-like nuisance parameters
-theta_jn, alpha0, psi, and analytically over distance and phase).
+theta_jn, alpha0, psi, and analytically over distance and phase -- or,
+as an alternative, taking the maximum-likelihood point estimate over
+the (theta_jn, alpha0, psi) grid instead, with no distance/phase
+marginalization and no grid-averaging penalty; see 'method' below).
 
 This module intentionally has minimal dependencies (numpy/scipy only,
 no lalsimulation) so it can be imported and called cheaply inside
@@ -161,10 +164,25 @@ def get_lookup_table():
     return _LOOKUP_TABLE
 
 
-def marginalize_segment(M, hh, ln_weight, z, lookup_table=None):
+def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
     """
-    Compute the log-likelihood marginalized over (theta_jn, alpha0, psi,
-    distance, phase) for a chunk of per-harmonic complex SNR values.
+    Compute marg_lnl for a chunk of per-harmonic complex SNR values,
+    using one of two methods:
+
+    method='max' (default): the maximum-likelihood point estimate
+        ln L_max = |d_h|^2 / (2*h_h) at each (theta_jn, alpha0, psi)
+        grid point, then the MAXIMUM of that over the whole grid. No
+        distance/phase marginalization, no grid-averaging penalty --
+        this is a pure point estimate over the discrete orientation
+        grid, picking whichever single grid point fits best.
+
+    method='marginalize': the original approach -- analytically
+        marginalize over distance and phase at each grid point (via
+        `lookup_table`), then marginalize (log-sum-exp, with the grid's
+        quadrature weights) over the grid itself. Kept as an
+        alternative; generally gives smaller values than 'max' due to
+        the "Occam factor" from both marginalization steps -- see
+        THA_MARG_INFO.md.
 
     Parameters
     ----------
@@ -174,27 +192,38 @@ def marginalize_segment(M, hh, ln_weight, z, lookup_table=None):
         Per-grid-point (h|h), independent of the data (bank-time precomputed).
     ln_weight : (n_grid,) float array
         Log of the (theta_jn, alpha0, psi) quadrature weights (shared
-        across templates for a fixed grid).
+        across templates for a fixed grid). Only used by
+        method='marginalize'.
     z : (5,) or (5, n_time) complex array
         snr_comp_1..5 at the sample(s) to evaluate.
+    method : {'max', 'marginalize'}
     lookup_table : LookupTableMarginalizedPhase22, optional
-        Defaults to the shared module-level instance.
+        Only used by method='marginalize'. Defaults to the shared
+        module-level instance.
 
     Returns
     -------
-    lnl_marg : float or (n_time,) float array
+    marg_lnl : float or (n_time,) float array
     """
-    lookup_table = lookup_table or get_lookup_table()
     z = np.asarray(z)
     scalar_input = (z.ndim == 1)
     if scalar_input:
         z = z[:, None]
 
     dh = M @ z  # (n_grid, n_time)
-    lnl = lookup_table.lnlike_marginalized(np.abs(dh), hh[:, None])
-    lnl_marg = logsumexp(ln_weight[:, None] + lnl, axis=0)
 
-    return lnl_marg[0] if scalar_input else lnl_marg
+    if method == 'max':
+        x = (np.abs(dh) ** 2) / (2. * hh[:, None])
+        result = np.max(x, axis=0)
+    elif method == 'marginalize':
+        lookup_table = lookup_table or get_lookup_table()
+        lnl = lookup_table.lnlike_marginalized(np.abs(dh), hh[:, None])
+        result = logsumexp(ln_weight[:, None] + lnl, axis=0)
+    else:
+        raise ValueError(
+            "method must be 'max' or 'marginalize', got {!r}".format(method))
+
+    return result[0] if scalar_input else result
 
 
 def weighted_correlation(a, b, psd, df, kmin, kmax):
@@ -316,7 +345,8 @@ def fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc, dpsi, weights_ta, n_psi):
     return M.reshape(-1, 5), hh.reshape(-1), ln_weight.reshape(-1)
 
 
-def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, lookup_table=None):
+def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, method='max',
+                        lookup_table=None):
     """
     All-in-one per-segment call: given a template's PSD-independent grid
     data (as returned by one entry of ``load_raw_grid_file``, MINUS the
@@ -325,7 +355,7 @@ def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, lookup_table=None
     stage already performs -- see bank.py's whitening/orthogonalization
     step -- rather than from the (now-removed) 'raws' entry of the grid
     file), and the segment's actual PSD, cheaply re-derive the
-    orientation/psi grid for that PSD and marginalize the given
+    orientation/psi grid for that PSD and compute marg_lnl for the given
     snr_comp_1..5 sample(s).
 
     Parameters
@@ -349,11 +379,14 @@ def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, lookup_table=None
         snr_comp_1..5.
     n_psi : int
         Psi quadrature resolution.
+    method : {'max', 'marginalize'}
+        See marginalize_segment.
     lookup_table : LookupTableMarginalizedPhase22, optional
+        Only used by method='marginalize'.
 
     Returns
     -------
-    lnl_marg : float or (n_time,) float array
+    marg_lnl : float or (n_time,) float array
     """
     Ep, Ec, hh_pp, hh_cc, hh_pc = derive_ep_ec_hh(
         raws, template_grid['A'], template_grid['B'],
@@ -361,7 +394,8 @@ def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, lookup_table=None
     M, hh, ln_weight = fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc,
                                 template_grid['dpsi'], template_grid['weights_ta'],
                                 n_psi)
-    return marginalize_segment(M, hh, ln_weight, z, lookup_table=lookup_table)
+    return marginalize_segment(M, hh, ln_weight, z, method=method,
+                               lookup_table=lookup_table)
 
 
 def load_raw_grid_file(path):

@@ -18,6 +18,8 @@
 
 import sys, os, copy
 import logging, argparse, numpy, itertools
+import h5py
+import tempfile
 import pycbc
 import pycbc.version
 from pycbc import vetoes, psd, waveform, strain, scheme, fft, DYN_RANGE_FAC, events
@@ -46,6 +48,70 @@ def update_progress(p,u,n):
 
 tstart = time.time()
 
+# Shared attrs a grid file carries -- must match between
+# pycbc_make_tha_marginalization_grid.txt's output format and
+# pycbc_combine_tha_marginalization_grid's understanding of it. Kept in
+# sync with that script rather than re-derived here.
+_GRID_SCALAR_ATTRS = [
+    'df', 'kmin', 'kmax', 'sample_rate', 'low_frequency_cutoff',
+    'n_theta', 'n_alpha', 'reference_psd_model', 'interp', 'approximant',
+]
+_GRID_ARRAY_ATTRS = ['theta_grid', 'alpha_grid', 'weights_ta']
+
+
+def _filter_grid_file_to_bank(grid_path, needed_hashes):
+    """Read only 'template_hash' from grid_path (cheap -- a few MB even
+    for a full ~490k-template bank) and, if it overlaps needed_hashes,
+    write a small temporary HDF5 file containing only the matching rows
+    of template_hash/A/B/beta, plus all the shared attrs unchanged.
+
+    Returns the path to actually pass to
+    tha_marginalize.load_raw_grid_file(): the temp file if filtering
+    happened, grid_path itself if every row in it was needed anyway (no
+    point copying), or None if grid_path has no overlap with
+    needed_hashes at all (caller should skip it entirely).
+
+    Why this exists: tha_marginalize.load_raw_grid_file() loads A/B for
+    every template in whatever file it's given, unconditionally
+    (f['A'][:]). That's fine for a single per-job grid file, but a
+    combined grid covering a full bank is tens of GB of A/B alone --
+    and a given search job's bank file is often only a small slice of
+    the full bank (e.g. a split-bank piece), so most of that data is
+    never actually needed by this job. Pre-filtering down to a tiny
+    temp file lets the existing, already-correct loader do the real
+    work on a much smaller input, rather than reimplementing its
+    internal per-template dict structure here.
+    """
+    with h5py.File(grid_path, 'r') as f:
+        grid_hashes = f['template_hash'][:]
+        mask = numpy.isin(grid_hashes, numpy.fromiter(needed_hashes, dtype=grid_hashes.dtype))
+        n_match = int(numpy.sum(mask))
+        if n_match == 0:
+            return None
+        if n_match == len(grid_hashes):
+            # Every row is needed anyway -- no point copying.
+            return grid_path
+
+        idx = numpy.nonzero(mask)[0]  # sorted, as h5py fancy indexing requires
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix='tha_grid_filtered_', suffix='.hdf')
+        os.close(tmp_fd)  # h5py will reopen it for writing
+        with h5py.File(tmp_path, 'w') as fout:
+            fout.create_dataset('template_hash', data=grid_hashes[idx])
+            fout.create_dataset('A', data=f['A'][idx.tolist()])
+            fout.create_dataset('B', data=f['B'][idx.tolist()])
+            fout.create_dataset('beta', data=f['beta'][idx.tolist()])
+            for name in _GRID_ARRAY_ATTRS:
+                fout.attrs[name] = f.attrs[name]
+            for name in _GRID_SCALAR_ATTRS:
+                fout.attrs[name] = f.attrs[name]
+            fout.attrs['start_index'] = f.attrs.get('start_index', 0)
+            fout.attrs['end_index'] = f.attrs.get('end_index', 0)
+        logging.info(
+            "Grid file %s: using %d/%d templates (filtered temp file %s)",
+            grid_path, n_match, len(grid_hashes), tmp_path)
+        return tmp_path
+
 parser = argparse.ArgumentParser(usage='',
     description="Find single detector gravitational-wave triggers.")
 
@@ -67,29 +133,39 @@ parser.add_argument("--marginalized-grid-file", type=str, nargs='+', default=Non
                        "marginalization-grid data, keyed by template_hash "
                        "(pass multiple files if the bank was processed in "
                        "several split jobs). If given, a 'marg_lnl' column "
-                       "(log-likelihood marginalized over the "
-                       "sky-orientation-like nuisance parameters theta_jn, "
-                       "alpha0, psi, and analytically over distance and "
-                       "phase) is added to the output triggers. Templates "
+                       "is added to the output triggers -- see "
+                       "--marg-lnl-method for how it's computed. Templates "
                        "not present in any of the given files get NaN. See "
                        "THA_MARG_INFO.md.")
+parser.add_argument("--marg-lnl-method", choices=['max', 'marginalize'],
+                    default='max',
+                    help="How to combine the (theta_jn, alpha0, psi) "
+                         "orientation-grid points into the final marg_lnl. "
+                         "'max' (default): the maximum-likelihood point "
+                         "estimate ln L_max = |d_h|^2/(2*h_h) at each grid "
+                         "point, then the MAXIMUM over the whole grid -- no "
+                         "distance/phase marginalization, no grid-averaging "
+                         "penalty. 'marginalize': the alternative -- "
+                         "analytically marginalize over distance and phase "
+                         "at each grid point, then marginalize (log-sum-exp) "
+                         "over the grid itself. See THA_MARG_INFO.md.")
 parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
                     help="Cut triggers with NewSNR less than THRESHOLD")
 parser.add_argument("--marg-lnl-threshold", type=float, metavar='THRESHOLD',
                     default=None,
-                    help="Cut triggers with the 5-harmonic marginalized "
-                         "log-likelihood ('marg_lnl') less than THRESHOLD, "
+                    help="Cut triggers with marg_lnl less than THRESHOLD, "
                          "before they are ever stored -- unlike "
                          "--newsnr-threshold (applied later, downstream), "
                          "this is applied directly in this script "
                          "immediately after marg_lnl is computed for each "
-                         "segment. Templates with no marginalization grid "
-                         "coverage get marg_lnl = NaN and are NOT affected "
-                         "by this threshold (their triggers pass through "
-                         "unfiltered by this option) -- only requires "
-                         "--marginalized-grid-file to be set as well for "
-                         "this to have any effect. Default: no threshold "
-                         "applied.")
+                         "segment, before the more expensive chisq/"
+                         "bank_chisq/sg_chisq are computed. Templates with "
+                         "no marginalization grid coverage get marg_lnl = "
+                         "NaN and are NOT affected by this threshold (their "
+                         "triggers pass through unfiltered) -- only "
+                         "requires --marginalized-grid-file to be set as "
+                         "well for this to have any effect. Default: no "
+                         "threshold applied.")
 parser.add_argument("--low-frequency-cutoff", type=float,
                   help="The low frequency cutoff to use for filtering (Hz)")
 parser.add_argument("--enable-bank-start-frequency", action='store_true',
@@ -253,10 +329,42 @@ pycbc.opt.verify_optimization_options(opt, parser)
 pycbc.init_logging(opt.verbose)
 
 if opt.marginalized_grid_file:
+    # Read only this job's bank's own template hashes (cheap -- a
+    # single small dataset) so each grid file can be filtered down to
+    # just what THIS job actually needs before being handed to
+    # tha_marginalize.load_raw_grid_file(), which otherwise loads A/B
+    # for every template in whatever file it's given -- see
+    # _filter_grid_file_to_bank's docstring for why this matters.
+    #
+    # IMPORTANT: read via waveform.TemplateBank, NOT raw h5py. The
+    # runtime lookup later in this script (bank.table.template_hash)
+    # goes through this same code path; raw h5py can disagree with it
+    # on sign for any hash with the top bit set (one reads a 64-bit
+    # value as signed, the other as unsigned), silently breaking the
+    # match for exactly those templates while working fine for others.
+    # Reading both sides the same way removes the ambiguity entirely.
+    from pycbc.waveform.bank import TemplateBank as _TemplateBankForHash
+    _bf_tb = _TemplateBankForHash(opt.bank_file)
+    _needed_hashes = set(int(h) for h in _bf_tb.table.template_hash)
+    del _bf_tb
+    logging.info("This job's bank file has %d templates.",
+                 len(_needed_hashes))
+
     marg_grid_by_hash = {}
+    _temp_grid_files = []
     for _grid_path in opt.marginalized_grid_file:
         logging.info("Loading marginalization grid file %s", _grid_path)
-        marg_grid_by_hash.update(tha_marginalize.load_raw_grid_file(_grid_path))
+        _actual_path = _filter_grid_file_to_bank(_grid_path, _needed_hashes)
+        if _actual_path is None:
+            logging.info("  -- no overlap with this bank's templates, "
+                         "skipping entirely")
+            continue
+        if _actual_path != _grid_path:
+            _temp_grid_files.append(_actual_path)
+        marg_grid_by_hash.update(
+            tha_marginalize.load_raw_grid_file(_actual_path))
+    for _tmp in _temp_grid_files:
+        os.remove(_tmp)
     logging.info("Loaded marginalization grid data for %d templates",
                  len(marg_grid_by_hash))
 else:
@@ -268,7 +376,6 @@ ctx = scheme.from_cli(opt)
 
 gwstrain = strain.from_cli(opt, dyn_range_fac=DYN_RANGE_FAC,
                            inj_filter_rejector=inj_filter_rejector)
-
 strain_segments = strain.StrainSegments.from_cli(opt, gwstrain)
 
 if marg_grid_by_hash is not None:
@@ -314,6 +421,7 @@ if marg_grid_by_hash is not None:
             _grid_path, _attrs['sample_rate'], _attrs['df'],
             _attrs['low_frequency_cutoff'], _attrs.get('interp'),
             _attrs.get('approximant'))
+
 
 def template_triggers(t_num):
     """ Get the triggers for a specific template
@@ -383,7 +491,13 @@ def template_triggers(t_num):
                 out_vals['snr_comp_{0}'.format(i + 1)] = snr_comp[idx+stilde.analyze.start] * norm
 
         if grid is not None:
-            segment_psd = numpy.asarray(stilde.psd.data)
+            # DYN_RANGE_FAC-scaled data is what stilde.psd is estimated
+            # against, but the raw harmonics below come straight from
+            # lalsimulation in true physical units, with no such
+            # scaling applied. Un-scaling the PSD here brings both onto
+            # the same footing before the marginalization math -- see
+            # THA_MARG_INFO.md.
+            segment_psd = numpy.asarray(stilde.psd.data) / (DYN_RANGE_FAC ** 2)
             # Raw harmonics are no longer stored in the grid file at all
             # (they were >99% of its size for a full bank -- see
             # THA_MARG_INFO.md). They don't need to be: bank.get()
@@ -419,6 +533,7 @@ def template_triggers(t_num):
                     "--sample-rate/--delta-f must exactly match this "
                     "search's configuration; see THA_MARG_INFO.md.".format(
                         len(raws[0]), len(segment_psd)))
+
             marg_z = numpy.array([out_vals['snr_comp_{0}'.format(i + 1)]
                                   for i in range(5)])
             # Re-derives the actual (PSD-dependent) filters for THIS
@@ -429,7 +544,8 @@ def template_triggers(t_num):
             # what bank.get() above already performed. See
             # THA_MARG_INFO.md.
             out_vals['marg_lnl'] = tha_marginalize.marginalize_for_psd(
-                grid, raws, segment_psd, marg_z).astype(float32)
+                grid, raws, segment_psd, marg_z,
+                method=opt.marg_lnl_method).astype(float32)
         else:
             out_vals['marg_lnl'] = numpy.full(len(snrv_full), numpy.nan,
                                               dtype=float32)
@@ -662,16 +778,16 @@ with ctx:
 
     tsetup = time.time() - tstart
     tcheckpoint = time.time()
-    
+
     tanalyze = list(range(tnum_start, len(bank)))
     n = opt.finalize_events_template_rate
     n = 1 if n is None else n
     tchunks = [tanalyze[i:i + n] for i in range(0, len(tanalyze), n)] 
-    
+
     mmap = map
     if opt.multiprocessing_nprocesses:
         mmap = Pool(opt.multiprocessing_nprocesses).map
-    
+
     for tchunk in tchunks:
         data = list(mmap(template_triggers, tchunk))
 

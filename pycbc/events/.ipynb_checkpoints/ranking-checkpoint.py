@@ -143,6 +143,19 @@ def marg_snr_from_lnl(marg_lnl):
     return numpy.sqrt(2. * numpy.clip(marg_lnl, 0., None))
 
 
+def marg_newsnr(marg_lnl, reduced_x2, q=6., n=2., **kwargs):
+    """ Exactly newsnr, but built from the marginalized-likelihood
+    SNR-equivalent (see marg_snr_from_lnl) instead of the ordinary
+    sum-in-quadrature matched-filter SNR. Converts marg_lnl -> an
+    SNR-equivalent via sqrt(2*marg_lnl), then applies exactly the same
+    chi-squared reweighting as the ordinary newsnr statistic -- no
+    sine-Gaussian veto or PSD-variation scaling (see
+    newsnr_marg_sgveto_psdvar_threshold above if those are wanted too).
+    """
+    marg_snr = marg_snr_from_lnl(marg_lnl)
+    return newsnr(marg_snr, reduced_x2, q=q, n=n, **kwargs)
+
+
 def newsnr_marg_sgveto_psdvar_threshold(marg_lnl, brchisq, sgchisq,
                                         psd_var_val, **kwargs):
     """ Exactly newsnr_sgveto_psdvar_threshold, but built from the
@@ -242,6 +255,31 @@ def get_newsnr(trigs, **kwargs):
     dof = 2. * trigs['chisq_dof'][:] - 2.
     nsnr = newsnr(
         trigs['snr'][:],
+        trigs['chisq'][:] / dof,
+        **kwargs
+    )
+    return numpy.array(nsnr, ndmin=1, dtype=numpy.float32)
+
+
+def get_marg_newsnr(trigs, **kwargs):
+    """
+    Calculate marg_newsnr for a trigs/dictionary object -- exactly
+    get_newsnr, but built from marg_lnl instead of snr.
+
+    Parameters
+    ----------
+    trigs: dict of numpy.ndarrays, h5py group (or similar dict-like object)
+        Dictionary-like object holding single detector trigger information.
+        'chisq_dof', 'marg_lnl', and 'chisq' are required keys
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of marg_newsnr values
+    """
+    dof = 2. * trigs['chisq_dof'][:] - 2.
+    nsnr = marg_newsnr(
+        trigs['marg_lnl'][:],
         trigs['chisq'][:] / dof,
         **kwargs
     )
@@ -426,6 +464,7 @@ sngls_ranking_function_dict = {
     get_newsnr_sgveto_psdvar_scaled_threshold,
     'newsnr_marg_sgveto_psdvar_threshold':
     get_newsnr_marg_sgveto_psdvar_threshold,
+    'marg_newsnr': get_marg_newsnr,
 }
 
 # Lists of datasets required in the trigs object for each function
@@ -447,6 +486,9 @@ reqd_datasets['newsnr_sgveto_psdvar_scaled_threshold'] = \
 # get_newsnr_marg_sgveto_psdvar_threshold).
 reqd_datasets['newsnr_marg_sgveto_psdvar_threshold'] = \
     ['marg_lnl', 'chisq', 'chisq_dof', 'sg_chisq', 'psd_var_val']
+# Same note: marg_newsnr replaces 'snr' with 'marg_lnl', no sg_chisq/
+# psd_var_val needed since it doesn't apply those (see marg_newsnr).
+reqd_datasets['marg_newsnr'] = ['marg_lnl', 'chisq', 'chisq_dof']
 
 
 def get_sngls_ranking_from_trigs(trigs, statname, **kwargs):
