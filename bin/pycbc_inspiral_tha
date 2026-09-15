@@ -139,16 +139,23 @@ parser.add_argument("--marginalized-grid-file", type=str, nargs='+', default=Non
                        "THA_MARG_INFO.md.")
 parser.add_argument("--marg-lnl-method", choices=['max', 'marginalize'],
                     default='max',
-                    help="How to combine the (theta_jn, alpha0, psi) "
-                         "orientation-grid points into the final marg_lnl. "
+                    help="How to treat distance and phase at each "
+                         "(theta_jn, alpha0, psi) orientation-grid point "
+                         "before marginalizing (log-sum-exp, with the "
+                         "grid's quadrature weights) over the grid itself "
+                         "-- the grid marginalization is IDENTICAL between "
+                         "the two choices; only the per-grid-point "
+                         "treatment of distance/phase differs. "
                          "'max' (default): the maximum-likelihood point "
                          "estimate ln L_max = |d_h|^2/(2*h_h) at each grid "
-                         "point, then the MAXIMUM over the whole grid -- no "
-                         "distance/phase marginalization, no grid-averaging "
-                         "penalty. 'marginalize': the alternative -- "
-                         "analytically marginalize over distance and phase "
-                         "at each grid point, then marginalize (log-sum-exp) "
-                         "over the grid itself. See THA_MARG_INFO.md.")
+                         "point -- no distance/phase marginalization, but "
+                         "the orientation grid itself is still "
+                         "marginalized over as usual. 'marginalize': the "
+                         "alternative -- analytically marginalize over "
+                         "distance and phase at each grid point too, "
+                         "generally giving smaller values than 'max' due "
+                         "to this extra marginalization step. See "
+                         "THA_MARG_INFO.md.")
 parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
                     help="Cut triggers with NewSNR less than THRESHOLD")
 parser.add_argument("--marg-lnl-threshold", type=float, metavar='THRESHOLD',

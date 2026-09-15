@@ -166,23 +166,24 @@ def get_lookup_table():
 
 def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
     """
-    Compute marg_lnl for a chunk of per-harmonic complex SNR values,
-    using one of two methods:
+    Compute marg_lnl for a chunk of per-harmonic complex SNR values.
 
-    method='max' (default): the maximum-likelihood point estimate
-        ln L_max = |d_h|^2 / (2*h_h) at each (theta_jn, alpha0, psi)
-        grid point, then the MAXIMUM of that over the whole grid. No
-        distance/phase marginalization, no grid-averaging penalty --
-        this is a pure point estimate over the discrete orientation
-        grid, picking whichever single grid point fits best.
+    Both methods marginalize (log-sum-exp, with the grid's quadrature
+    weights) over the (theta_jn, alpha0, psi) orientation grid
+    IDENTICALLY -- they differ only in how the per-grid-point
+    log-likelihood-like quantity fed into that sum is computed:
 
-    method='marginalize': the original approach -- analytically
-        marginalize over distance and phase at each grid point (via
-        `lookup_table`), then marginalize (log-sum-exp, with the grid's
-        quadrature weights) over the grid itself. Kept as an
-        alternative; generally gives smaller values than 'max' due to
-        the "Occam factor" from both marginalization steps -- see
-        THA_MARG_INFO.md.
+    method='max' (default): at each grid point, the maximum-likelihood
+        POINT ESTIMATE over distance and phase, ln L_max =
+        |d_h|^2 / (2*h_h) -- i.e. no distance/phase marginalization.
+        The grid itself is still marginalized over exactly as in
+        method='marginalize'.
+
+    method='marginalize': the original approach -- at each grid point,
+        analytically marginalize over distance and phase (via
+        `lookup_table`) instead of taking the point estimate. Generally
+        gives smaller values than 'max' due to the extra "Occam factor"
+        from this additional marginalization -- see THA_MARG_INFO.md.
 
     Parameters
     ----------
@@ -192,8 +193,7 @@ def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
         Per-grid-point (h|h), independent of the data (bank-time precomputed).
     ln_weight : (n_grid,) float array
         Log of the (theta_jn, alpha0, psi) quadrature weights (shared
-        across templates for a fixed grid). Only used by
-        method='marginalize'.
+        across templates for a fixed grid). Used by BOTH methods.
     z : (5,) or (5, n_time) complex array
         snr_comp_1..5 at the sample(s) to evaluate.
     method : {'max', 'marginalize'}
@@ -213,16 +213,15 @@ def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
     dh = M @ z  # (n_grid, n_time)
 
     if method == 'max':
-        x = (np.abs(dh) ** 2) / (2. * hh[:, None])
-        result = np.max(x, axis=0)
+        lnl = (np.abs(dh) ** 2) / (2. * hh[:, None])
     elif method == 'marginalize':
         lookup_table = lookup_table or get_lookup_table()
         lnl = lookup_table.lnlike_marginalized(np.abs(dh), hh[:, None])
-        result = logsumexp(ln_weight[:, None] + lnl, axis=0)
     else:
         raise ValueError(
             "method must be 'max' or 'marginalize', got {!r}".format(method))
 
+    result = logsumexp(ln_weight[:, None] + lnl, axis=0)
     return result[0] if scalar_input else result
 
 
