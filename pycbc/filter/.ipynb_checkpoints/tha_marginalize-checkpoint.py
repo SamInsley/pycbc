@@ -164,7 +164,8 @@ def get_lookup_table():
     return _LOOKUP_TABLE
 
 
-def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
+def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None,
+                        return_argmax=False):
     """
     Compute marg_lnl for a chunk of per-harmonic complex SNR values.
 
@@ -200,10 +201,30 @@ def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
     lookup_table : LookupTableMarginalizedPhase22, optional
         Only used by method='marginalize'. Defaults to the shared
         module-level instance.
+    return_argmax : bool, optional
+        If True, additionally return the per-sample best-fit grid point:
+        the index (into the flattened (n_grid,) axis shared by M/hh/
+        ln_weight) that maximizes the RAW per-grid-point ``lnl`` --
+        deliberately NOT weighted by ln_weight, since the quadrature
+        weight is a grid-density factor for the marginalization integral,
+        not part of "which orientation best explains the data" (and in
+        practice ln_weight is constant across the grid here anyway, so
+        weighting it wouldn't change the argmax regardless) -- together
+        with the ``dh`` and ``hh`` values at that point. Default False,
+        which keeps the original return signature unchanged for existing
+        callers.
 
     Returns
     -------
     marg_lnl : float or (n_time,) float array
+    best_idx, best_dh, best_hh : only present if return_argmax=True
+        best_idx : int or (n_time,) int array
+            Index into the flattened grid of the point with the largest
+            raw lnl, per time sample.
+        best_dh : complex or (n_time,) complex array
+            ``dh`` (= M @ z) at that point.
+        best_hh : float or (n_time,) float array
+            ``hh`` at that point.
     """
     z = np.asarray(z)
     scalar_input = (z.ndim == 1)
@@ -222,7 +243,18 @@ def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None):
             "method must be 'max' or 'marginalize', got {!r}".format(method))
 
     result = logsumexp(ln_weight[:, None] + lnl, axis=0)
-    return result[0] if scalar_input else result
+
+    if not return_argmax:
+        return result[0] if scalar_input else result
+
+    best_idx = np.argmax(lnl, axis=0)  # (n_time,)
+    n_time = dh.shape[1]
+    best_dh = dh[best_idx, np.arange(n_time)]
+    best_hh = hh[best_idx]
+
+    if scalar_input:
+        return result[0], int(best_idx[0]), best_dh[0], best_hh[0]
+    return result, best_idx, best_dh, best_hh
 
 
 def weighted_correlation(a, b, psd, df, kmin, kmax):
@@ -326,6 +358,20 @@ def fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc, dpsi, weights_ta, n_psi):
     the (theta_jn, alpha0) grid's Ep/Ec/hh, producing the combined
     (n_grid*n_psi, 5) M matrix, (n_grid*n_psi,) hh vector, and
     (n_grid*n_psi,) log-weight vector consumed by marginalize_segment.
+
+    Returns
+    -------
+    M : (n_grid*n_psi, 5) complex array
+    hh : (n_grid*n_psi,) float array
+    ln_weight : (n_grid*n_psi,) float array
+    psi_grid : (n_psi,) float array
+        The psi values used to build the psi axis of M/hh/ln_weight (each
+        (theta_jn, alpha0) grid point repeats this same psi_grid, in the
+        same order, so a flattened index ``j`` decomposes as
+        ``ta_idx, psi_idx = divmod(j, n_psi)``). Returned so callers can
+        translate a flattened grid index (e.g. from
+        marginalize_segment's return_argmax) back into a physical psi
+        value.
     """
     psi_grid = (np.arange(n_psi) + 0.5) * (np.pi / n_psi)
     weight_psi = np.full(n_psi, 1. / n_psi)
@@ -341,11 +387,11 @@ def fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc, dpsi, weights_ta, n_psi):
         hh[:, p] = (c2 ** 2) * hh_pp - 2 * c2 * s2 * hh_pc.real + (s2 ** 2) * hh_cc
         ln_weight[:, p] = np.log(weights_ta) + np.log(weight_psi[p])
 
-    return M.reshape(-1, 5), hh.reshape(-1), ln_weight.reshape(-1)
+    return M.reshape(-1, 5), hh.reshape(-1), ln_weight.reshape(-1), psi_grid
 
 
 def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, method='max',
-                        lookup_table=None):
+                        lookup_table=None, return_bestfit=False):
     """
     All-in-one per-segment call: given a template's PSD-independent grid
     data (as returned by one entry of ``load_raw_grid_file``, MINUS the
@@ -361,10 +407,10 @@ def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, method='max',
     ----------
     template_grid : dict
         One value from the dict returned by ``load_raw_grid_file``, with
-        keys 'A', 'B', 'dpsi', 'weights_ta' -- NOT 'raws' (see raws
-        below). The grid file no longer stores 'raws' at all, to avoid
-        the prohibitive per-template storage cost of the full raw
-        harmonic frequency series (see THA_MARG_INFO.md).
+        keys 'A', 'B', 'dpsi', 'weights_ta', 'theta_grid', 'alpha_grid'
+        -- NOT 'raws' (see raws below). The grid file no longer stores
+        'raws' at all, to avoid the prohibitive per-template storage cost
+        of the full raw harmonic frequency series (see THA_MARG_INFO.md).
     raws : list of 5 (n_freq,) complex arrays
         The raw (unwhitened, unnormalized) harmonic waveforms for this
         template, in reverse_flag-adjusted order -- obtained live from
@@ -382,19 +428,70 @@ def marginalize_for_psd(template_grid, raws, psd, z, n_psi=16, method='max',
         See marginalize_segment.
     lookup_table : LookupTableMarginalizedPhase22, optional
         Only used by method='marginalize'.
+    return_bestfit : bool, optional
+        If True, additionally return the per-sample best-fit orientation
+        point (theta, alpha, psi, snr, phase): the (theta_jn, alpha0,
+        psi) grid point with the largest raw per-point log-likelihood
+        (see marginalize_segment's return_argmax), plus the SNR and
+        phase of the data projected onto that point's filter. Requires
+        `template_grid` to include 'theta_grid'/'alpha_grid' (added by
+        load_raw_grid_file). Default False, which keeps the original
+        return signature unchanged for existing callers.
 
     Returns
     -------
     marg_lnl : float or (n_time,) float array
+    theta, alpha, psi, snr, phase, ta_idx : only present if
+        return_bestfit=True
+        theta, alpha, psi, snr, phase: each a float, or (n_time,) float
+        array matching marg_lnl's shape. `snr` is defined so the
+        point-estimate log-likelihood at that grid point is snr**2 / 2
+        (i.e. snr = |dh| / sqrt(hh), the usual matched-filter SNR
+        convention). `phase` is angle(dh) -- the orbital/coalescence
+        phase to pass as `phi0` to regenerate the actual best-fit
+        waveform, e.g. PhenomXPTemplate.gen_harmonics_comp(theta, alpha,
+        phase, psi, df, f_final).
+        ta_idx: int or (n_time,) int array. The index into the
+        (theta_jn, alpha0) axis (i.e. into template_grid['A']/['B']/
+        ['dpsi']/['theta_grid']/['alpha_grid'], NOT the psi-folded flat
+        grid) of the winning grid point. theta/alpha/psi are already a
+        float (and, once round-tripped through a trigger file, typically
+        float32) rendering of this point, but ta_idx is the *exact*,
+        losslessly reconstructible identifier: it's what a caller (e.g.
+        chisq.py's grid-point reconstruction) should save and use to
+        re-index template_grid['A'][ta_idx]/['B'][ta_idx]/['dpsi'][ta_idx]
+        directly, rather than trying to re-match a rounded theta/alpha
+        value back to a row of theta_grid/alpha_grid. psi itself needs no
+        such treatment -- it only ever enters downstream through a smooth
+        cos(2*(psi-dpsi))/sin(2*(psi-dpsi)) rotation, so a float32 psi is
+        fine to reuse directly.
     """
     Ep, Ec, hh_pp, hh_cc, hh_pc = derive_ep_ec_hh(
         raws, template_grid['A'], template_grid['B'],
         psd, template_grid['df'], template_grid['kmin'], template_grid['kmax'])
-    M, hh, ln_weight = fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc,
-                                template_grid['dpsi'], template_grid['weights_ta'],
-                                n_psi)
-    return marginalize_segment(M, hh, ln_weight, z, method=method,
-                               lookup_table=lookup_table)
+    M, hh, ln_weight, psi_grid = fold_psi(
+        Ep, Ec, hh_pp, hh_cc, hh_pc,
+        template_grid['dpsi'], template_grid['weights_ta'], n_psi)
+
+    if not return_bestfit:
+        return marginalize_segment(M, hh, ln_weight, z, method=method,
+                                   lookup_table=lookup_table)
+
+    marg_lnl, best_idx, best_dh, best_hh = marginalize_segment(
+        M, hh, ln_weight, z, method=method, lookup_table=lookup_table,
+        return_argmax=True)
+
+    theta_grid = template_grid['theta_grid']
+    alpha_grid = template_grid['alpha_grid']
+    ta_idx, psi_idx = np.divmod(best_idx, n_psi)
+
+    theta = theta_grid[ta_idx]
+    alpha = alpha_grid[ta_idx]
+    psi = psi_grid[psi_idx]
+    snr = np.abs(best_dh) / np.sqrt(best_hh)
+    phase = np.angle(best_dh)
+
+    return marg_lnl, theta, alpha, psi, snr, phase, ta_idx
 
 
 def load_raw_grid_file(path):
@@ -409,7 +506,12 @@ def load_raw_grid_file(path):
         Maps int(template_hash) -> dict with keys 'A', 'B'
         ((n_grid, 5) complex arrays), 'dpsi' ((n_grid,) float array),
         'weights_ta' ((n_grid,) float array), 'df', 'kmin', 'kmax'
-        (shared metadata, duplicated per template for convenience).
+        (shared metadata, duplicated per template for convenience), and
+        'theta_grid', 'alpha_grid' ((n_grid,) float arrays -- the same
+        array objects shared by reference across every template, not
+        copied per template; needed to translate a flattened grid index,
+        as returned by marginalize_for_psd(..., return_bestfit=True),
+        back into physical (theta_jn, alpha0) values).
         Does NOT include 'raws' -- the raw harmonics are obtained live,
         at actual filtering time, from bank.py's own already-cached
         template.h1..h5 (see marginalize_for_psd's raws argument and
@@ -438,7 +540,8 @@ def load_raw_grid_file(path):
             dpsi = _dpsi_grid(theta_grid, alpha_grid, beta_all[i])
             grid_by_hash[int(h)] = dict(
                 A=A_all[i], B=B_all[i], dpsi=dpsi, weights_ta=weights_ta,
-                df=df, kmin=kmin, kmax=kmax)
+                df=df, kmin=kmin, kmax=kmax,
+                theta_grid=theta_grid, alpha_grid=alpha_grid)
     return grid_by_hash
 
 

@@ -58,6 +58,14 @@ _GRID_SCALAR_ATTRS = [
 ]
 _GRID_ARRAY_ATTRS = ['theta_grid', 'alpha_grid', 'weights_ta']
 
+# Number of (theta_jn, alpha0, psi) grid best-fit outputs stored per
+# trigger alongside marg_lnl -- see the marg_lnl computation block below.
+# marg_ta_idx is handled separately (see below) since it's an integer
+# grid index, not a float, and so needs a different NaN-fallback
+# sentinel (-1, not numpy.nan).
+_MARG_BESTFIT_KEYS = ('marg_theta', 'marg_alpha', 'marg_psi',
+                      'marg_snr', 'marg_phase')
+
 
 def _filter_grid_file_to_bank(grid_path, needed_hashes):
     """Read only 'template_hash' from grid_path (cheap -- a few MB even
@@ -134,9 +142,13 @@ parser.add_argument("--marginalized-grid-file", type=str, nargs='+', default=Non
                        "(pass multiple files if the bank was processed in "
                        "several split jobs). If given, a 'marg_lnl' column "
                        "is added to the output triggers -- see "
-                       "--marg-lnl-method for how it's computed. Templates "
-                       "not present in any of the given files get NaN. See "
-                       "THA_MARG_INFO.md.")
+                       "--marg-lnl-method for how it's computed -- along "
+                       "with the (theta_jn, alpha0, psi) grid point that "
+                       "produced it ('marg_theta'/'marg_alpha'/'marg_psi') "
+                       "and the SNR/phase of the data projected onto that "
+                       "point ('marg_snr'/'marg_phase'). Templates not "
+                       "present in any of the given files get NaN in all "
+                       "six columns. See THA_MARG_INFO.md.")
 parser.add_argument("--marg-lnl-method", choices=['max', 'marginalize'],
                     default='max',
                     help="How to treat distance and phase at each "
@@ -155,7 +167,12 @@ parser.add_argument("--marg-lnl-method", choices=['max', 'marginalize'],
                          "distance and phase at each grid point too, "
                          "generally giving smaller values than 'max' due "
                          "to this extra marginalization step. See "
-                         "THA_MARG_INFO.md.")
+                         "THA_MARG_INFO.md. Note: the best-fit "
+                         "(theta/alpha/psi/snr/phase) columns are always "
+                         "derived from the RAW per-grid-point "
+                         "log-likelihood regardless of this choice -- see "
+                         "tha_marginalize.marginalize_segment's "
+                         "return_argmax.")
 parser.add_argument("--newsnr-threshold", type=float, metavar='THRESHOLD',
                     help="Cut triggers with NewSNR less than THRESHOLD")
 parser.add_argument("--marg-lnl-threshold", type=float, metavar='THRESHOLD',
@@ -173,6 +190,33 @@ parser.add_argument("--marg-lnl-threshold", type=float, metavar='THRESHOLD',
                          "requires --marginalized-grid-file to be set as "
                          "well for this to have any effect. Default: no "
                          "threshold applied.")
+parser.add_argument("--marg-exclude-hf-cutoff", type=float, default=300.,
+                    metavar='HZ',
+                    help="Frequency (Hz) above which a harmonic's power "
+                         "is checked against "
+                         "--marg-exclude-hf-fraction-threshold, for "
+                         "excluding badly-modelled harmonics from the "
+                         "marg_lnl computation. Only used if "
+                         "--marginalized-grid-file is set. Default: 300.")
+parser.add_argument("--marg-exclude-hf-fraction-threshold", type=float,
+                    default=0.4, metavar='FRACTION',
+                    help="If a harmonic's ACTUAL orthonormal matched-"
+                         "filter template (not the raw harmonic) has "
+                         "more than this fraction of its PSD-weighted "
+                         "power above --marg-exclude-hf-cutoff Hz, "
+                         "exclude that harmonic entirely from the "
+                         "marg_lnl computation for this template/segment "
+                         "-- its raw harmonic is zeroed before "
+                         "marginalization, which cleanly removes it from "
+                         "every downstream quantity. This targets "
+                         "templates (typically in the transitional-"
+                         "precession regime -- see THA_MARG_INFO.md) "
+                         "whose waveform model concentrates a harmonic's "
+                         "power unphysically close to merger, where it "
+                         "can be spuriously matched by short, high-"
+                         "frequency glitches and inflate marg_lnl. Set "
+                         "above 1.0 to disable this check entirely (a "
+                         "fraction can never exceed 1.0). Default: 0.5.")
 parser.add_argument("--low-frequency-cutoff", type=float,
                   help="The low frequency cutoff to use for filtering (Hz)")
 parser.add_argument("--enable-bank-start-frequency", action='store_true',
@@ -436,6 +480,12 @@ def template_triggers(t_num):
     template = None
     tparam = None
     out_vals_all = []
+    # Cache the high-frequency harmonic exclusion decision ONCE per
+    # template (computed on the first segment encountered), rather than
+    # recomputing it every segment -- see where it's used below for why
+    # this is a reasonable approximation rather than an exact
+    # per-segment recomputation.
+    _hf_exclusion_mask = None
     # Hoisted out of the per-segment loop: this only depends on t_num,
     # not on anything segment-specific, so there is no reason to repeat
     # the dict lookup every segment.
@@ -497,6 +547,15 @@ def template_triggers(t_num):
             else:
                 out_vals['snr_comp_{0}'.format(i + 1)] = snr_comp[idx+stilde.analyze.start] * norm
 
+        # Reset every loop iteration (rather than only setting them inside
+        # `if grid is not None:` below) so a template/segment with no
+        # grid coverage never accidentally sees a previous iteration's
+        # leftover raws/segment_psd -- chisq.py's grid-point
+        # reconstruction relies on these being genuinely None (not stale
+        # data) whenever marg_ta_idx is -1.
+        raws = None
+        segment_psd = None
+
         if grid is not None:
             # DYN_RANGE_FAC-scaled data is what stilde.psd is estimated
             # against, but the raw harmonics below come straight from
@@ -541,6 +600,59 @@ def template_triggers(t_num):
                     "search's configuration; see THA_MARG_INFO.md.".format(
                         len(raws[0]), len(segment_psd)))
 
+            # Exclude any harmonic whose ACTUAL orthonormal matched-filter
+            # template (not the raw harmonic) has too much of its power
+            # concentrated above --marg-exclude-hf-cutoff Hz -- the
+            # signature of a harmonic whose waveform model is poorly
+            # constrained near merger, prone to being spuriously matched
+            # by short, high-frequency glitches rather than tracking
+            # genuine inspiral content. See THA_MARG_INFO.md.
+            #
+            # Computed ONCE per template (cached in _hf_exclusion_mask,
+            # using the FIRST segment's PSD as representative), not
+            # re-derived every segment -- PSD is typically quasi-
+            # stationary across a single analysis run, so this trades a
+            # small amount of per-segment exactness (the real fraction
+            # can drift slightly as the PSD is re-estimated segment to
+            # segment) for avoiding the same 5x5 linear algebra several
+            # times over for every segment of the same template.
+            #
+            # Zeroing raws[k] here (not bank.curr_tmp.h1..h5, so ordinary
+            # matched filtering above is completely unaffected) cleanly
+            # removes that harmonic from every downstream quantity (Graw,
+            # hh, Ep/Ec, M) -- derive_gram_schmidt_transform's existing
+            # near-zero-sigma regularization already handles a
+            # fully-zeroed harmonic correctly (verified: no NaN, no
+            # crash, that harmonic contributes exactly zero thereafter).
+            if opt.marg_exclude_hf_fraction_threshold <= 1.0:
+                if _hf_exclusion_mask is None:
+                    _Graw_hf = tha_marginalize.raw_gram_matrix(
+                        raws, segment_psd, grid['df'], grid['kmin'], grid['kmax'])
+                    _T_hf, _sigma_hf = tha_marginalize.derive_gram_schmidt_transform(_Graw_hf)
+                    _raws_arr_hf = numpy.array(raws)
+                    _e_k_hf = _T_hf @ (_raws_arr_hf / _sigma_hf[:, None])
+
+                    _freqs_hf = numpy.arange(grid['kmax']) * grid['df']
+                    _above_hf = _freqs_hf[grid['kmin']:grid['kmax']] > opt.marg_exclude_hf_cutoff
+                    _hf_exclusion_mask = numpy.zeros(5, dtype=bool)
+                    for _k in range(5):
+                        _weight_hf = (numpy.abs(_e_k_hf[_k, grid['kmin']:grid['kmax']]) ** 2
+                                     / segment_psd[grid['kmin']:grid['kmax']])
+                        _total_hf = numpy.sum(_weight_hf)
+                        _frac_hf = numpy.sum(_weight_hf[_above_hf]) / _total_hf if _total_hf > 0 else 0.
+                        if _frac_hf > opt.marg_exclude_hf_fraction_threshold:
+                            logging.debug(
+                                "Excluding h%d from marg_lnl for template "
+                                "hash=%d (high-freq fraction %.4g > %.4g, "
+                                "decided once from segment %d)", _k + 1,
+                                int(bank.table.template_hash[t_num]), s_num,
+                                _frac_hf, opt.marg_exclude_hf_fraction_threshold)
+                            _hf_exclusion_mask[_k] = True
+
+                for _k in range(5):
+                    if _hf_exclusion_mask[_k]:
+                        raws[_k] = numpy.zeros_like(raws[_k])
+
             marg_z = numpy.array([out_vals['snr_comp_{0}'.format(i + 1)]
                                   for i in range(5)])
             # Re-derives the actual (PSD-dependent) filters for THIS
@@ -550,12 +662,55 @@ def template_triggers(t_num):
             # products), zero new lalsimulation calls at all beyond
             # what bank.get() above already performed. See
             # THA_MARG_INFO.md.
-            out_vals['marg_lnl'] = tha_marginalize.marginalize_for_psd(
+            #
+            # return_bestfit=True additionally returns the
+            # (theta_jn, alpha0, psi) grid point with the largest raw
+            # per-point log-likelihood, and the SNR/phase of the data
+            # projected onto that point's filter -- these are stored as
+            # their own trigger columns below, and (once chisq.py's
+            # rewrite lands) are what the chisq veto regenerates the
+            # comparison waveform from directly, instead of the
+            # harmonic-weighted-sum reconstruction it used before.
+            (marg_lnl, marg_theta, marg_alpha, marg_psi,
+             marg_snr, marg_phase, marg_ta_idx) = tha_marginalize.marginalize_for_psd(
                 grid, raws, segment_psd, marg_z,
-                method=opt.marg_lnl_method).astype(float32)
+                method=opt.marg_lnl_method, return_bestfit=True)
+            out_vals['marg_lnl'] = marg_lnl.astype(float32)
+            out_vals['marg_theta'] = numpy.asarray(marg_theta, dtype=float32)
+            out_vals['marg_alpha'] = numpy.asarray(marg_alpha, dtype=float32)
+            out_vals['marg_psi'] = numpy.asarray(marg_psi, dtype=float32)
+            out_vals['marg_snr'] = numpy.asarray(marg_snr, dtype=float32)
+            out_vals['marg_phase'] = numpy.asarray(marg_phase, dtype=float32)
+            # The exact, losslessly-reconstructible identifier of the
+            # winning (theta_jn, alpha0) grid point -- an index into
+            # grid['A']/['B']/['dpsi']/['theta_grid']/['alpha_grid'].
+            # marg_theta/marg_alpha above are a float32 (lossy) rendering
+            # of the same point, kept for convenience/quick inspection;
+            # chisq.py's grid-point reconstruction uses marg_ta_idx (with
+            # marg_psi, which needs no such care -- see
+            # tha_marginalize.marginalize_for_psd's docstring) rather
+            # than trying to re-match marg_theta/marg_alpha back to a row
+            # of theta_grid/alpha_grid.
+            out_vals['marg_ta_idx'] = numpy.asarray(marg_ta_idx, dtype=numpy.int32)
         else:
             out_vals['marg_lnl'] = numpy.full(len(snrv_full), numpy.nan,
                                               dtype=float32)
+            # No grid coverage for this template -- there is no best-fit
+            # orientation to report, so these get NaN too (matching
+            # marg_lnl's own "not applicable" convention). chisq.py's
+            # reconstruction must handle NaN theta/alpha/psi/phase here
+            # (e.g. by falling back to the harmonic-weighted-sum
+            # reconstruction) -- see the TODO at the power_chisq.values()
+            # call below.
+            for _key in _MARG_BESTFIT_KEYS:
+                out_vals[_key] = numpy.full(len(snrv_full), numpy.nan,
+                                            dtype=float32)
+            # -1 is not a valid grid index -- chisq.py's reconstruction
+            # branches on numpy.isnan(marg_theta) already, so this value
+            # is never actually read in that case, but it needs to be an
+            # int (not NaN) to fit the int32 column dtype.
+            out_vals['marg_ta_idx'] = numpy.full(len(snrv_full), -1,
+                                                 dtype=numpy.int32)
 
         if opt.marg_lnl_threshold is not None:
             # NaN (no marginalization grid coverage for this template --
@@ -590,9 +745,26 @@ def template_triggers(t_num):
                                 snrv_full, norm,
                                 idx+stilde.analyze.start)
 
+        # Reconstructs the comparison filter with reconstruct_template
+        # exactly as before, EXCEPT the per-harmonic weights fed into it
+        # now come from the trigger's best-fit (theta_jn, alpha0, psi)
+        # marginalization grid point's analytic coefficients (see
+        # chisq.py's _bestfit_M_row), instead of the trigger's own
+        # measured per-harmonic SNRs. By linearity of correlation,
+        # corr(Sum_k M[ta_idx,k]*h_k, data) ==
+        # Sum_k M[ta_idx,k]*corr(h_k, data), so chisq.py re-derives the
+        # grid-point's M-row itself from `grid`/`raws`/`segment_psd` (the
+        # same PSD-independent per-template grid data and live raw
+        # harmonics used above for marg_lnl) plus `marg_ta_idx`/
+        # `marg_psi`, and combines it with the already-computed `corrs`
+        # -- no lalsimulation call and no fresh matched filter needed.
+        # Triggers whose template has no marginalization grid coverage
+        # (marg_ta_idx == -1) get chisq = NaN.
         out_vals['chisq'], out_vals['chisq_dof'] = \
-              power_chisq.values(corrs, snrs, snrv_full, norm, stilde.psd,
-                                 idx+stilde.analyze.start, template_comps)
+              power_chisq.values(corrs, snrv_full, norm,
+                                 idx+stilde.analyze.start, template_comps,
+                                 grid, raws, segment_psd,
+                                 out_vals['marg_ta_idx'], out_vals['marg_psi'])
 
         out_vals['sg_chisq'] = sg_chisq.values(
             stilde / stilde.psd ** 0.5, template_comps[0],
@@ -667,6 +839,29 @@ with ctx:
         'psd_var_val'    : float32,
         'sigmasq'        : float32,
         'marg_lnl'       : float32,
+        # (theta_jn, alpha0, psi) grid point with the largest raw
+        # per-point log-likelihood for this trigger (see
+        # tha_marginalize.marginalize_for_psd's return_bestfit), plus
+        # the SNR/phase of the data projected onto that point's filter.
+        # NaN for triggers whose template has no marginalization grid
+        # coverage (or when --marginalized-grid-file isn't given at
+        # all), matching marg_lnl's own convention.
+        'marg_theta'     : float32,
+        'marg_alpha'     : float32,
+        'marg_psi'       : float32,
+        'marg_snr'       : float32,
+        'marg_phase'     : float32,
+        # Exact, losslessly-reconstructible identifier of the same grid
+        # point as marg_theta/marg_alpha above (an index into that
+        # template's grid['A']/['B']/['dpsi']/['theta_grid']/
+        # ['alpha_grid']) -- used by chisq.py to reconstruct the
+        # best-fit-orientation filter without needing to re-match a
+        # rounded float32 theta/alpha back to a grid row. -1 for
+        # triggers with no marginalization grid coverage (see
+        # marg_theta's NaN convention above -- this is that same "not
+        # applicable" case, just spelled as -1 since this column is an
+        # int).
+        'marg_ta_idx'    : numpy.int32,
                 }
     out_types.update(SingleDetSGChisq.returns)
     out_vals_ref = {key: None for key in out_types}
@@ -686,7 +881,7 @@ with ctx:
     if opt.psdvar_segment is not None:
         logging.info("Calculating PSD variation")
         psd_var = pycbc.psd.calc_filt_psd_variation(gwstrain, opt.psdvar_segment,
-                opt.psdvar_short_segment, opt.psdvar_long_segment, 
+                opt.psdvar_short_segment, opt.psdvar_long_segment,
                 opt.psdvar_psd_duration, opt.psdvar_psd_stride,
                 opt.psd_estimation, opt.psdvar_low_freq, opt.psdvar_high_freq)
 
@@ -789,7 +984,7 @@ with ctx:
     tanalyze = list(range(tnum_start, len(bank)))
     n = opt.finalize_events_template_rate
     n = 1 if n is None else n
-    tchunks = [tanalyze[i:i + n] for i in range(0, len(tanalyze), n)] 
+    tchunks = [tanalyze[i:i + n] for i in range(0, len(tanalyze), n)]
 
     mmap = map
     if opt.multiprocessing_nprocesses:
@@ -804,11 +999,11 @@ with ctx:
                 event_mgr.new_template(tmplt=tparam)
 
                 for edata in out_vals_all:
-                    event_mgr.add_template_events(names, [edata[n] for n in names])              
-                                    
+                    event_mgr.add_template_events(names, [edata[n] for n in names])
+
                 event_mgr.cluster_template_events("time_index", "snr", cluster_window)
                 event_mgr.finalize_template_events()
-        
+
         if opt.finalize_events_template_rate is not None:
             event_mgr.consolidate_events(opt, gwstrain=gwstrain)
 
@@ -820,7 +1015,7 @@ with ctx:
         if opt.checkpoint_exit_maxtime and \
             (time.time() - tstart > opt.checkpoint_exit_maxtime):
             event_mgr.save_state(max(tchunk), opt.output + '.checkpoint')
-            sys.exit(opt.checkpoint_exit_code)           
+            sys.exit(opt.checkpoint_exit_code)
 
 event_mgr.consolidate_events(opt, gwstrain=gwstrain)
 event_mgr.finalize_events()

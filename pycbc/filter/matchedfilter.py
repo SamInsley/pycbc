@@ -1074,7 +1074,6 @@ class MatchedFilterTHAControl(object):
                                   seg[corr_slice],
                                   self.corr_mem_comps[i][corr_slice])
                 self.correlators[-1].append(corr)
-
         # setup up the ifft we will do
         self.iffts = []
         for i in range(5):

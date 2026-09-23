@@ -531,6 +531,20 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
     """Class that handles precomputation and memory management for efficiently
     running the power chisq in a single detector inspiral analysis when
     maximizing analytically over sky location.
+
+    The comparison filter is reconstructed at each trigger's best-fit
+    (theta_jn, alpha0, psi) marginalization grid point (see
+    pycbc.filter.tha_marginalize.marginalize_for_psd's return_bestfit),
+    using that grid point's own analytic/geometric harmonic-combination
+    coefficients (see _bestfit_M_row) rather than the SNR-weighted
+    harmonic-sum reconstruction described in arXiv:2305.19270 eq. 40
+    (h = sum_k <h_k^perp|s> h_k^perp). By linearity of correlation, this
+    only ever needs the already-computed per-harmonic correlations
+    `corrs` -- no fresh matched filter and no lalsimulation call. The
+    SNR-weighted-sum method is kept as `reconstruct_template` and used as
+    a fallback for triggers whose template has no marginalization grid
+    coverage (theta comes through as NaN, ta_idx as -1, in that case --
+    see pycbc_inspiral_tha).
     """
     def __init__(self, **kwds):
         super(SingleDetTHAPowerChisq, self).__init__(**kwds)
@@ -546,19 +560,151 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
                                 low_frequency_cutoff=template.f_lower,
                                 high_frequency_cutoff=None)
         return bins
-    
-    def reconstruct_template(self, templates, snrs, num_comps):
-        scales = snrs / numpy.sum(numpy.abs(snrs) ** 2.) ** 0.5
+
+    def reconstruct_template(self, templates, weights, num_comps):
+        """Weighted-sum reconstruction: h = sum_k w_k h_k^perp, i.e. each
+        orthonormal harmonic scaled by a (here, internally re-normalized)
+        complex weight and summed.
+
+        `weights` used to always be the trigger's own measured
+        per-harmonic SNRs (arXiv:2305.19270 eq. 40: w_k = <h_k^perp|s>,
+        the noise/data-dependent maximum-likelihood combination). It is
+        now instead the best-fit marginalization grid point's analytic
+        combination coefficients (see _bestfit_M_row) -- the physical
+        harmonic content of the true best-fit-orientation waveform,
+        which depends only on the PSD, not on this segment's noise
+        realization. The function itself doesn't care which -- it just
+        normalizes and sums whatever 5-vector it's given.
+        """
+        scales = weights / numpy.sum(numpy.abs(weights) ** 2.) ** 0.5
         template = templates[0] * scales[0]
         for i in range(1, num_comps):
             template += templates[i] * scales[i]
 
         template.f_lower = templates[0].f_lower
         template.params = templates[0].params
-        return template
+        return template, scales
 
-    def values(self, corrs, snrs, snrv, snr_norm, psd, indices, templates):
+    def _bestfit_M_row(self, grid, raws, segment_psd, ta_idx, psi):
+        """The (5,) complex row of the marginalization grid's M matrix
+        for one specific (theta_jn, alpha0) grid point (`ta_idx`) and an
+        arbitrary `psi`, i.e. the coefficients c_k such that the
+        whitened/normalized best-fit-orientation waveform equals
+        Sum_k c_k * e_k, where e_k are the SAME 5 orthonormal harmonic
+        templates (`templates`) used for ordinary matched filtering --
+        this is what values() below feeds into reconstruct_template as
+        `weights`.
+
+        This is the single-grid-point version of
+        tha_marginalize.derive_ep_ec_hh + fold_psi: those build the M
+        row (and hh) for every grid point at once (needed for the
+        marginalization sum over the whole grid), but here we already
+        know which one point we want, so we only need Ep/Ec at that one
+        (theta_jn, alpha0) index, rotated by the given psi.
+
+        By linearity of correlation, the SAME coefficients (once
+        renormalized by reconstruct_template) combine the
+        already-computed per-harmonic correlations `corrs` into the
+        correlation of the best-fit-orientation waveform against the
+        data (corr(Sum_k c_k*h_k, data) == Sum_k c_k*corr(h_k, data)) --
+        see values() below -- without needing a fresh matched filter or
+        any lalsimulation call.
+
+        Parameters
+        ----------
+        grid : dict
+            One entry of tha_marginalize.load_raw_grid_file's return
+            (the SAME `grid` used for this template's marg_lnl
+            computation in pycbc_inspiral_tha) -- needs 'A', 'B', 'dpsi',
+            'df', 'kmin', 'kmax'.
+        raws : list of 5 (n_freq,) complex arrays
+            The raw (unwhitened) harmonics for this template -- the SAME
+            `raws` passed to tha_marginalize.marginalize_for_psd for this
+            segment (bank.curr_tmp.h1..h5, zero-padded to segment_psd's
+            length).
+        segment_psd : (n_freq,) float array
+            The SAME un-scaled PSD passed to marginalize_for_psd for this
+            segment (i.e. stilde.psd / DYN_RANGE_FAC**2, NOT the
+            DYN_RANGE_FAC-scaled stilde.psd used for ordinary whitening)
+            -- using this exact PSD is what makes the M row reproduce
+            the SAME Ep/Ec/M that picked out this grid point as the
+            best fit in the first place.
+        ta_idx : int
+            Index into grid['A']/['B']/['dpsi'] for the winning
+            (theta_jn, alpha0) grid point (out_vals['marg_ta_idx']).
+            Must not be -1 (the "no grid coverage" sentinel) -- callers
+            check that themselves (see values()).
+        psi : float
+            The best-fit psi for this trigger (out_vals['marg_psi']) --
+            entering only through a smooth cos(2*(psi-dpsi))/
+            sin(2*(psi-dpsi)) rotation, so a float32-rounded value is
+            fine here (unlike ta_idx, which must be exact).
+
+        Returns
+        -------
+        M_row : (5,) complex array
+            c_k coefficients, ordered to match `templates`/`corrs`.
+        """
+        from pycbc.waveform.tha_marginalize import derive_ep_ec_hh
+
+        Ep, Ec, _hh_pp, _hh_cc, _hh_pc = derive_ep_ec_hh(
+            raws, grid['A'], grid['B'], segment_psd,
+            grid['df'], grid['kmin'], grid['kmax'])
+
+        dpsi_i = grid['dpsi'][ta_idx]
+        delta = psi - dpsi_i
+        c2, s2 = numpy.cos(2. * delta), numpy.sin(2. * delta)
+        return c2 * Ep[ta_idx].conj() - s2 * Ec[ta_idx].conj()
+
+    def values(self, corrs, snrv, snr_norm, indices, templates,
+               grid, raws, segment_psd, ta_idx, psi):
         """ Calculate the chisq at points given by indices.
+
+        Same overall structure as the original implementation (build a
+        comparison template + chisq bins per trigger, then combine the
+        already-computed per-harmonic correlations `corrs` with the same
+        weights used to build that template): the only thing that has
+        changed is where the per-harmonic weights fed into
+        reconstruct_template come from -- the best-fit marginalization
+        grid point's analytic coefficients (_bestfit_M_row), instead of
+        the trigger's own measured per-harmonic SNRs.
+
+        Parameters
+        ----------
+        corrs : list of (FrequencySeries or None)
+            The 5 per-harmonic correlation FrequencySeries (frequency
+            domain, conj(harmonic)*data) -- the SAME `corrs` returned by
+            matched_filter_and_cluster and already used for ordinary
+            matched filtering. Combined directly with the grid point's
+            weights -- no fresh correlation is ever performed here.
+        snrv : Array
+            SNR values at the trigger locations (only used for
+            self.snr_threshold gating -- no longer used inside the chisq
+            formula itself, see below).
+        snr_norm : float
+            SNR normalization (matched_filter_and_cluster's `norm`).
+        indices : Array
+            Indices (relative to the correlation vectors) to compute
+            chisq at.
+        templates : list of (FrequencySeries or None)
+            The 5 whitened/orthogonalized harmonic templates, combined
+            with the grid point's weights (via reconstruct_template) to
+            get the best-fit-orientation waveform's frequency content
+            for calculate_chisq_bins.
+        grid : dict
+            This template's PSD-independent marginalization grid data
+            (the SAME `grid` used for marg_lnl in pycbc_inspiral_tha).
+        raws : list of 5 (n_freq,) complex arrays
+            This template's live raw harmonics (see _bestfit_M_row).
+        segment_psd : (n_freq,) float array
+            This segment's un-scaled PSD (see _bestfit_M_row).
+        ta_idx, psi : Array
+            Per-trigger best-fit grid-point values
+            (out_vals['marg_ta_idx']/['marg_psi'] from
+            pycbc_inspiral_tha), aligned with snrv/indices. ta_idx is -1
+            for triggers with no marginalization grid coverage -- those
+            triggers get chisq = NaN (there is no other reconstruction
+            to fall back to any more).
 
         Returns
         -------
@@ -576,41 +722,102 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
                 num_above = above.sum()
                 logging.info('%s above chisq activation threshold' % num_above)
                 above_indices = indices[above]
-                above_snrv = snrv[above]
+                above_ta_idx = ta_idx[above]
+                above_psi = psi[above]
                 rchisq = numpy.zeros(len(indices), dtype=numpy.float32)
                 dof = -100
             else:
                 above_indices = indices
-                above_snrv = snrv
+                above_ta_idx = ta_idx
+                above_psi = psi
 
             if num_above > 0:
                 bins = []
                 scales = []
+                covered = []
                 num_comps = len([t for t in templates if t is not None])
                 for lidx, index in enumerate(above_indices):
-                    local_snrs = numpy.array([s[index] for s in snrs[:num_comps]])
-                    template = self.reconstruct_template(templates, local_snrs, num_comps)
-
-                    bs = self.calculate_chisq_bins(template)
-                    bins += [bs]
-                    scales += [
-                        local_snrs.conj()
-                        / numpy.sum((local_snrs * local_snrs.conj()).real) ** 0.5
-                    ]
+                    ta = int(above_ta_idx[lidx])
+                    if ta == -1:
+                        # No marginalization grid coverage for this
+                        # trigger's template -- no best-fit orientation
+                        # to reconstruct from, so no chisq bins to build
+                        # either. Handled below (chisq forced to NaN)
+                        # rather than falling back to any other
+                        # reconstruction.
+                        covered.append(False)
+                        bins += [numpy.zeros(self.parse_option(
+                            templates[0], self.num_bins) + 1, dtype=int)]
+                        scales += [numpy.zeros(num_comps, dtype=complex)]
+                        continue
+                    covered.append(True)
+                    m_row = self._bestfit_M_row(
+                        grid, raws, segment_psd, ta, above_psi[lidx])
+                    # m_row is M[ta_idx,:] (same M as tha_marginalize's
+                    # dh = M @ z), NOT the physical combination
+                    # coefficients directly: <h_recon|data> = Sum_k
+                    # conj(c_k)*<h_k|data>, matched against dh = Sum_k
+                    # M[k]*z_k term-by-term gives c_k = conj(M[k]). So
+                    # the template needs conj(m_row) (reconstruct_template
+                    # uses its `weights` argument un-conjugated, exactly
+                    # like the old code passed raw local_snrs = c_k for
+                    # the SNR-weighted method) -- and the corr-combining
+                    # weight below then needs conj(c_k) = m_row, i.e.
+                    # sc.conj() undoes reconstruct_template's internal
+                    # conj(m_row) back to m_row. This is the same
+                    # template-uses-c_k / corr-uses-conj(c_k) asymmetry
+                    # the original SNR-weighted method had (there,
+                    # c_k = local_snrs, un-conjugated for the template,
+                    # conj(local_snrs) for the corr combine).
+                    template, sc = self.reconstruct_template(
+                        templates, m_row.conj(), num_comps)
+                    bins += [self.calculate_chisq_bins(template)]
+                    scales += [sc.conj()]
 
                 bins = numpy.stack(bins, axis=0)
                 scales = numpy.stack(scales, axis=0)
-                
+                covered = numpy.array(covered)
+
                 dof = (bins.shape[1] - 1) * 2 - 2
                 chisq = numpy.zeros(
                     (len(above_indices), bins.shape[1] - 1),
                     dtype=complex_same_precision_as(corrs[0])
                 )
-                
+
                 for i in range(num_comps):
                     chisq += shift_multibin(corrs[i], above_indices, scales[:, i], bins)
+
+                # Reference total power for the chisq identity must come
+                # from summing THESE SAME bins (this reconstruction's own
+                # whole-band response), not from the trigger's separately
+                # -measured combined-harmonic SNR (above_snrv) -- that's
+                # the response of a DIFFERENT filter (the SNR-maximizing
+                # combination; above_snrv = sqrt(Sum|snr_k|^2) is, by
+                # Cauchy-Schwarz, the LARGEST total any unit-normalized
+                # combination of the 5 harmonics can reach, strictly
+                # greater than this filter's actual total for generic
+                # grid weights) -- reusing it here would make this
+                # chisq come out spuriously negative for ordinary,
+                # well-matched signals.
+                #
+                # With the conjugate convention above correct, this
+                # total is provably identical to out_vals['marg_snr']
+                # for this same trigger, up to a phase (both a
+                # consequence, not a coincidence): total = Sum_i
+                # sc.conj()[i]*z_i = Sum_i (m_row[i]/||m_row||)*z_i =
+                # dh/||m_row|| (dh = M@z from tha_marginalize, using the
+                # SAME m_row row), and ||m_row||^2 = Sum_k|m_row_k|^2 =
+                # hh (h_recon's own norm, since the 5 harmonics are
+                # orthonormal) -- so |total| = |dh|/sqrt(hh) = marg_snr
+                # exactly. Recomputed here from `chisq`'s own bins
+                # (rather than reusing the already-stored marg_snr)
+                # purely for robustness: it stays correct even if
+                # marg_snr's own computation ever drifted out of sync
+                # with this one.
+                total = numpy.sum(chisq, axis=1)
                 chisq = numpy.sum((chisq * chisq.conj()).real, axis=1) * (bins.shape[1] - 1)
-                chisq = (chisq - (above_snrv.conj() * above_snrv).real) * (snr_norm ** 2.0)
+                chisq = (chisq - (total.conj() * total).real) * (snr_norm ** 2.0)
+                chisq[~covered] = numpy.nan
 
             if self.snr_threshold:
                 if num_above > 0:
@@ -618,6 +825,6 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
             else:
                 rchisq = chisq
 
-            return rchisq, numpy.repeat(dof, len(indices))# dof * numpy.ones_like(indices)
+            return rchisq, numpy.repeat(dof, len(indices))
         else:
             return None, None
