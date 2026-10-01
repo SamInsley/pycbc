@@ -124,8 +124,8 @@ def _build_condorio_site(name, cp):
     """Build a no-shared-filesystem, Condor I/O site (data.configuration=
     condorio), without adding it to a site catalog yet.
 
-    Shared by condorpool_copy and condorpool_container, which differ only
-    in whether HTCondor's container universe is enabled.
+    Shared by condorpool_copy and condorpool_container. Anything they do
+    not have in common is set by the main setup function.
     """
     site = Site(name, arch=Arch.X86_64, os_type=OS.LINUX)
     add_site_pegasus_profile(site, cp)
@@ -136,23 +136,15 @@ def _build_condorio_site(name, cp):
     site.add_profiles(Namespace.PEGASUS, key='transfer.bypass.input.staging',
                       value="true")
     # This explicitly disables symlinking
-    site.add_profiles(Namespace.PEGASUS, key='nosymlink',
-                      value=True)
-    site.add_profiles(Namespace.PEGASUS, key='auxillary.local',
-                      value="true")
-    site.add_profiles(Namespace.CONDOR, key="My.OpenScienceGrid",
-                      value="False")
-    site.add_profiles(Namespace.CONDOR, key="should_transfer_files",
-                      value="Yes")
-    site.add_profiles(Namespace.CONDOR, key="when_to_transfer_output",
-                      value="ON_EXIT_OR_EVICT")
-    site.add_profiles(Namespace.CONDOR, key="getenv", value="True")
-    site.add_profiles(Namespace.CONDOR, key="My.DESIRED_Sites",
-                      value='"nogrid"')
-    site.add_profiles(Namespace.CONDOR, key="My.IS_GLIDEIN",
-                      value='"False"')
-    site.add_profiles(Namespace.CONDOR, key="My.flock_local",
-                      value="True")
+    site.add_profiles(Namespace.PEGASUS, key="nosymlink", value=True)
+    site.add_profiles(Namespace.CONDOR, key="My.OpenScienceGrid", value="False")
+    site.add_profiles(Namespace.CONDOR, key="should_transfer_files", value="Yes")
+    site.add_profiles(
+        Namespace.CONDOR, key="when_to_transfer_output", value="ON_EXIT_OR_EVICT"
+    )
+    site.add_profiles(Namespace.CONDOR, key="My.DESIRED_Sites", value='"nogrid"')
+    site.add_profiles(Namespace.CONDOR, key="My.IS_GLIDEIN", value='"False"')
+    site.add_profiles(Namespace.CONDOR, key="My.flock_local", value="True")
     site.add_profiles(Namespace.DAGMAN, key="retry", value="2")
     return site
 
@@ -160,6 +152,8 @@ def _build_condorio_site(name, cp):
 def add_condorpool_copy_site(sitecat, cp):
     """Add condorpool_copy site to site catalog"""
     site = _build_condorio_site("condorpool_copy", cp)
+    site.add_profiles(Namespace.PEGASUS, key='auxillary.local',
+                      value="true")
     sitecat.add_sites(site)
 
 
