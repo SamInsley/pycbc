@@ -14,6 +14,7 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
+import copy
 import logging
 import os.path
 
@@ -34,6 +35,22 @@ except ImportError:
 from pycbc.workflow.pegasus_workflow import SubWorkflow
 
 logger = logging.getLogger('pycbc.workflow.minifollowups')
+
+
+def write_config_for_subworkflow(cp, config_path):
+    """Write a copy of cp to config_path for a minifollowup-style
+    sub-workflow generator to read back in, with a flag set so that it
+    does not try to resolve or fetch any input files named in it: that
+    executable may run somewhere (e.g. inside a container on an execute
+    node) with no reason to have access to whatever those paths name, and
+    the files are only actually needed later, when the sub-workflow it
+    generates is itself planned.
+    """
+    cp = copy.deepcopy(cp)
+    cp.set('workflow', 'skip-resolve-input-files', '')
+    cp.write(open(config_path, 'w'))
+
+
 
 def grouper(iterable, n, fillvalue=None):
     """ Create a list of n length tuples
@@ -91,8 +108,10 @@ def setup_foreground_minifollowups(workflow, coinc_file, single_triggers,
     makedir(dax_output)
 
     # turn the config file into a File class
-    config_path = os.path.abspath(dax_output + '/' + '_'.join(tags) + 'foreground_minifollowup.ini')
-    workflow.cp.write(open(config_path, 'w'))
+    config_path = os.path.abspath(
+        dax_output + "/" + "_".join(tags) + "foreground_minifollowup.ini"
+    )
+    write_config_for_subworkflow(workflow.cp, config_path)
 
     config_file = resolve_url_to_file(config_path)
 
@@ -188,9 +207,10 @@ def setup_single_det_minifollowups(workflow, single_trig_file, tmpltbank_file,
 
     # turn the config file into a File class
     curr_ifo = single_trig_file.ifo
-    config_path = os.path.abspath(dax_output + '/' + curr_ifo + \
-                                   '_'.join(tags) + 'singles_minifollowup.ini')
-    workflow.cp.write(open(config_path, 'w'))
+    config_path = os.path.abspath(
+        dax_output + "/" + curr_ifo + "_".join(tags) + "singles_minifollowup.ini"
+    )
+    write_config_for_subworkflow(workflow.cp, config_path)
 
     config_file = resolve_url_to_file(config_path)
 
@@ -299,8 +319,10 @@ def setup_injection_minifollowups(workflow, injection_file, inj_xml_file,
     makedir(dax_output)
 
     # turn the config file into a File class
-    config_path = os.path.abspath(dax_output + '/' + '_'.join(tags) + 'injection_minifollowup.ini')
-    workflow.cp.write(open(config_path, 'w'))
+    config_path = os.path.abspath(
+        dax_output + "/" + "_".join(tags) + "injection_minifollowup.ini"
+    )
+    write_config_for_subworkflow(workflow.cp, config_path)
 
     config_file = resolve_url_to_file(config_path)
 
@@ -1257,9 +1279,10 @@ def setup_upload_prep_minifollowups(workflow, coinc_file, xml_all_file,
     makedir(out_dir)
 
     # turn the config file into a File class
-    config_path = os.path.abspath(dax_output + '/' + '_'.join(tags) + \
-                                  'upload_prep_minifollowup.ini')
-    workflow.cp.write(open(config_path, 'w'))
+    config_path = os.path.abspath(
+        dax_output + "/" + "_".join(tags) + "upload_prep_minifollowup.ini"
+    )
+    write_config_for_subworkflow(workflow.cp, config_path)
 
     config_file = resolve_url_to_file(config_path)
 
