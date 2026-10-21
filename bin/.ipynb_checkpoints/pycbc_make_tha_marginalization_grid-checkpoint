@@ -14,6 +14,11 @@ itself (pycbc.filter.tha_marginalize), so this file only needs building
 once and is reused regardless of which PSD(s) the search later
 encounters.
 
+The raw harmonics themselves are NOT stored in the output file (they
+were >99% of its size for a full bank); only A, B, beta and the
+per-harmonic max_response are. The search obtains the raw harmonics
+live from bank.py's own template generation.
+
 See THA_MARG_INFO.md for the full derivation and rationale.
 """
 import argparse
@@ -22,9 +27,12 @@ import numpy as np
 
 import pycbc
 from pycbc import psd as pycbc_psd
-from pycbc.waveform.bank import TemplateBank, PhenomXPTemplate
+from pycbc.waveform.bank import TemplateBank, PhenomXPTemplate, _dpsi
 from pycbc.waveform.tha_marg_grid import make_theta_alpha_grid, compute_raw_and_ab
+import pycbc.filter.tha_marginalize as tha_marginalize
 from pycbc.io import HFile
+
+N_HARM = 5
 
 parser = argparse.ArgumentParser(description=__doc__)
 pycbc.add_common_pycbc_options(parser)
@@ -105,6 +113,11 @@ parser.add_argument('--interp', action='store_true',
                           'but not exact. Default: off (direct '
                           'generation, exact to ~machine precision). '
                           'See THA_MARG_INFO.md.')
+parser.add_argument('--n-psi', type=int, default=16,
+                     help='Number of psi points used when folding the grid '
+                          'to compute each harmonic\'s maximum response '
+                          '(must match what the search folds with). '
+                          'Default: 16.')
 opt = parser.parse_args()
 
 if (opt.num_jobs is None) != (opt.job_index is None):
@@ -147,34 +160,64 @@ else:
 theta_grid, alpha_grid, weights_ta = make_theta_alpha_grid(opt.n_theta, opt.n_alpha)
 n_grid = len(theta_grid)
 
+# PSD used for the max-response calculation. Must stay float64: PSD values
+# (~1e-46) underflow to 0 in float32, which turns every response into NaN.
+response_psd = np.asarray(ref_psd.data, dtype=np.float64)
+
 template_hash = []
-raws_all = []
 A_all = []
 B_all = []
 beta_all = []
+max_response_all = []   # (n_templates, 5): max over the grid of |<e_k|h>|^2/<h|h>
+
+
+def max_harmonic_response(raws, A, B, beta):
+    """For one template, each harmonic's maximum fraction of the signal
+    power over the full (theta_jn, alpha0, psi) grid. Same calculation as
+    pycbc_max_response_per_template, but using the raws/A/B just built
+    instead of reading them back from a grid file."""
+    dpsi = np.array([_dpsi(t, a, beta) for t, a in zip(theta_grid, alpha_grid)])
+    Ep, Ec, hh_pp, hh_cc, hh_pc = tha_marginalize.derive_ep_ec_hh(
+        raws, A, B, response_psd, opt.delta_f, kmin, kmax)
+    M, hh, _, _ = tha_marginalize.fold_psi(
+        Ep, Ec, hh_pp, hh_cc, hh_pc, dpsi, weights_ta, opt.n_psi)
+    return np.array([np.nanmax(np.abs(M[:, k]) ** 2 / hh)
+                     for k in range(N_HARM)])
 
 for i in indices:
     row = bank.table[i]
     logging.info("Template %d/%d (hash %d)", i, n_templates, row.template_hash)
+    # raws (the 5 raw harmonics) are only needed in memory here, to solve
+    # for A, B and compute max_response. They are NOT written to the output
+    # file: they dominate its size and the search regenerates them itself.
     tmpl, raws, A, B = compute_raw_and_ab(
         row, opt.sample_rate, opt.low_frequency_cutoff, opt.delta_f,
         opt.sample_rate / 2., theta_grid, alpha_grid, kmin, kmax,
         ref_psd.data, interp=opt.interp)
     template_hash.append(int(row.template_hash))
-    raws_all.append(np.array(raws))
     A_all.append(A)
     B_all.append(B)
     beta_all.append(tmpl.beta)
 
+    max_resp = max_harmonic_response(raws, A, B, tmpl.beta)
+    max_response_all.append(max_resp)
+    logging.info("  max response per harmonic: %s",
+                 np.array2string(max_resp, precision=4))
+
 with HFile(opt.output, 'w') as f:
     f.create_dataset('template_hash', data=np.array(template_hash, dtype=np.int64))
-    f.create_dataset('raws', data=np.array(raws_all, dtype=np.complex64))
     f.create_dataset('A', data=np.array(A_all, dtype=np.complex128))
     f.create_dataset('B', data=np.array(B_all, dtype=np.complex128))
     f.create_dataset('beta', data=np.array(beta_all, dtype=np.float64))
-    f.create_dataset('theta_grid', data=theta_grid)
-    f.create_dataset('alpha_grid', data=alpha_grid)
-    f.create_dataset('weights_ta', data=weights_ta)
+    # The orientation grid is the same for every template, so it is stored
+    # as file attributes -- this is where tha_marginalize.load_raw_grid_file
+    # and pycbc_combine_tha_marginalization_grid read it from.
+    f.attrs['theta_grid'] = theta_grid
+    f.attrs['alpha_grid'] = alpha_grid
+    f.attrs['weights_ta'] = weights_ta
+    # (n_templates, 5): max over the grid of |<e_k|h>|^2/<h|h> per harmonic
+    f.create_dataset('max_response', data=np.array(max_response_all,
+                                                   dtype=np.float64).reshape(-1, N_HARM))
     f.attrs['df'] = opt.delta_f
     f.attrs['kmin'] = kmin
     f.attrs['kmax'] = kmax
@@ -188,7 +231,7 @@ with HFile(opt.output, 'w') as f:
     # Generation-provenance metadata. sample_rate/df/low_frequency_cutoff
     # are load-bearing: pycbc_inspiral_tha checks these match its own
     # configuration before using this file and refuses to run otherwise
-    # (a mismatch here means the frequency binning of `raws` does not
+    # (a mismatch here means the frequency binning of A/B does not
     # line up with the search's PSD/filters). interp is recorded for
     # provenance/reproducibility only -- it is not compared against
     # anything at search time, since pycbc_inspiral_tha's actual filters

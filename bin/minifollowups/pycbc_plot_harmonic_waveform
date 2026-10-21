@@ -15,7 +15,25 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-""" Plot the single detector trigger timeseries """
+""" Plot the single detector trigger's best-grid-point waveform and its
+harmonics.
+
+CHANGED relative to the original script (all edits are marked "# CHANGED"):
+  1. The per-harmonic weights are no longer the trigger's own
+     snr_comp_k / coa_phase_comp_k.  They are the components of the
+     waveform at the trigger's best marginalization-grid point
+     (marg_theta, marg_alpha, marg_psi), times marg_snr * exp(i marg_phase):
+         c_k = marg_snr e^{i marg_phase} <e_k | h_hat(theta_JN, alpha0, psi)>
+     (e_k = the whitened, orthonormal harmonics from
+     get_whitened_normalized_comps, h_hat = unit-norm whitened grid waveform).
+     Full waveform = sum_k c_k e_k.
+  2. The dotted harmonic curves are now c_k e_k (they sum to the full
+     waveform) instead of the bare e_k.
+  3. The figure uses the 2x2 layout of the grid-bestfit plot (full waveform and
+     merger zoom on top, layered harmonics below) instead of one panel per ifo.
+Nothing else (segment/PSD lookup, time shift, scaling) changes.
+No grid file is needed: the grid-point waveform is generated directly.
+"""
 import argparse
 import logging
 import sys
@@ -34,6 +52,7 @@ from pycbc.events import select_segments_by_definer
 from pycbc.filter.matchedfilter import sigma
 from pycbc.io import HFile, SingleDetTriggers
 from pycbc.waveform.bank import PhenomXPTemplate, compute_beta
+from pycbc.waveform.tha_marg_grid import get_interpolated_hp_hc  # CHANGED: new import
 from pycbc.strain import StrainSegments
 import pycbc.waveform.bank as bank
 
@@ -81,6 +100,52 @@ def obtain_trigger_amp_phase(trigs, special_idx):
         phase_key = 'coa_phase_comp_{}'.format(i+1)
         amplitudes_dict[i] = trigs.trigs[key][special_idx]/norm_snr
         phases_dict[i] = trigs.trigs[phase_key][special_idx]
+    return amplitudes_dict, phases_dict
+
+
+def obtain_gridpoint_amp_phase(trigs, special_idx, phenom_object, harmonics_dict,
+                               psd, df):
+    """CHANGED: replaces obtain_trigger_amp_phase (now unused).
+
+    Returns amplitude/phase dicts such that  A[k] * exp(i phase[k])  =
+        marg_snr * exp(i marg_phase) * <e_k | h_hat_grid>,
+    where h_hat_grid is the unit-norm, whitened waveform
+        cos(2 delta) h_plus - sin(2 delta) h_cross,  delta = psi - dpsi
+    generated at the trigger's best grid point with phi0 = 0 (this is the
+    waveform the marginalization used).
+    """
+    theta = float(trigs.trigs['marg_theta'][special_idx])
+    alpha0 = float(trigs.trigs['marg_alpha'][special_idx])
+    psi = float(trigs.trigs['marg_psi'][special_idx])
+    marg_snr = float(trigs.trigs['marg_snr'][special_idx])
+    marg_phase = float(trigs.trigs['marg_phase'][special_idx])
+
+    # grid-point waveform (same call the grid file was built with)
+    hp, hc = get_interpolated_hp_hc(phenom_object, theta, alpha0, 0., df,
+                                    phenom_object.f_final)
+    delta = psi - bank._dpsi(theta, alpha0, phenom_object.beta)
+    hs = [hp * numpy.cos(2 * delta) - hc * numpy.sin(2 * delta)]
+
+    # whiten + normalise exactly as the harmonics are
+    kmin = int(phenom_object.flow / df)
+    kmax = int(phenom_object.f_final / df)
+    phenom_object.whiten_and_normalize(hs, psd ** 0.5, len(hs[0]), df,
+                                       kmin, kmax)
+    H = numpy.asarray(hs[0].data)
+
+    def vdot(a, b):
+        return numpy.vdot(a[kmin:kmax], b[kmin:kmax])
+
+    E = [numpy.asarray(harmonics_dict[k].data) for k in range(len(harmonics_dict))]
+    norm1 = vdot(E[0], E[0]).real           # <e_1|e_1>; e_k are orthonormal in this unit
+    h_norm = numpy.sqrt(vdot(H, H).real / norm1)
+    scale = marg_snr * numpy.exp(1j * marg_phase)
+
+    amplitudes_dict, phases_dict = {}, {}
+    for k, e_k in enumerate(E):
+        coef = scale * vdot(e_k, H) / norm1 / h_norm
+        amplitudes_dict[k] = numpy.abs(coef)
+        phases_dict[k] = numpy.angle(coef)
     return amplitudes_dict, phases_dict
 
 
@@ -209,8 +274,6 @@ def compute_harmonic_waveform(trigs, special_idx, ifo, merge_psd_file,
         copy=False
     )
     
-    amplitudes_dict, phases_dict = obtain_trigger_amp_phase(trigs, special_idx)
-
     #Create the template PhenomObject
     #### Hard-coded stuff change!! Get it from the triggers SOMEHOW?
     flen = int(sample_rate * segment_length/2+1)
@@ -239,6 +302,13 @@ def compute_harmonic_waveform(trigs, special_idx, ifo, merge_psd_file,
     for i in range(ncomp):
         harmonics_dict[i] = harmonics[i]
 
+    # CHANGED: weights now come from the best grid point (was obtain_trigger_amp_phase(...),
+    # which used the trigger's snr_comp_k / coa_phase_comp_k and sat before the
+    # harmonics were built; it now needs them, so it sits here).
+    amplitudes_dict, phases_dict = obtain_gridpoint_amp_phase(
+        trigs, special_idx, phenom_object, harmonics_dict, psd,
+        1.0/segment_length)
+
     p_det = _make_waveform_from_precessing_harmonics(phenom_object, harmonics_dict, amplitudes_dict, phases_dict)
 
     # Apply 2s time-shift to wrap the merger away from the endfor plotting
@@ -251,7 +321,9 @@ def compute_harmonic_waveform(trigs, special_idx, ifo, merge_psd_file,
 
     harmonics = []
     for i in range(ncomp):
-        harm_temp = harmonics_dict[i].to_timeseries()
+        # CHANGED: weight each harmonic by its grid-point coefficient c_k (was the bare e_k)
+        c_i = complex(amplitudes_dict[i] * numpy.exp(1j * phases_dict[i]))
+        harm_temp = (harmonics_dict[i] * c_i).to_timeseries()
         harm_temp = harm_temp.cyclic_time_shift(-2)
         harm_temp /= amp_factor
         harmonics.append(harm_temp)
@@ -306,21 +378,38 @@ parser.add_argument('--segment-start-pad', type=int, required=True)
 parser.add_argument("--segment-end-pad", type=int, required=True)
 parser.add_argument("--pad-data", default=8, type=int)
 
+# CHANGED: options for the 2x2 "A5" layout (same names/defaults as the grid-bestfit plot)
+parser.add_argument('--window-before', type=float, default=7.0,
+    help="Seconds before merger spanned by the left (full) panels, which stop "
+         "where the zoom panels begin. Default=7.0")
+parser.add_argument('--zoom-before', type=float, default=0.05,
+    help="Seconds before merger spanned by the right (zoom) panels. Default=0.05")
+parser.add_argument('--zoom-after', type=float, default=0.02,
+    help="Seconds after merger spanned by the right (zoom) panels. Default=0.02")
+# CHANGED: accepted but unused, so the old command line still works
+# (the grid-point waveform is generated directly; no grid file is read).
+parser.add_argument('--marginalized-grid-file', nargs='*', default=None,
+    help="Unused; accepted for command-line compatibility.")
+
 parser.add_argument('--output-file')
 
 args = parser.parse_args()
 init_logging(args.verbose)
 
-fig = pylab.figure()
-
 bankf = h5py.File(args.bank_file, 'r')
 
-fig, axs = pylab.subplots(len(args.single_trigger_files), 1, figsize=(14,8))
-if len(args.single_trigger_files) == 1:
-    axs = [axs]
-axs_count=0
+# Only plot detectors that have a special trigger (single-detector events have one)
+ifos = [ifo for ifo in args.single_trigger_files.keys()
+        if args.special_trigger_ids[ifo] is not None]
+if not ifos:
+    raise ValueError("No --special-trigger-ids given for any detector")
 
-for ifo in args.single_trigger_files.keys():
+# CHANGED: 2 rows per ifo (full waveform / harmonics) x 2 columns (inspiral / merger zoom)
+n_ifo = len(ifos)
+fig, axs = pylab.subplots(2 * n_ifo, 2, figsize=(14, 6 * n_ifo), squeeze=False)
+
+row = 0
+for ifo in ifos:
     logging.info("Getting %s triggers", ifo)
 
     trigs = SingleDetTriggers(
@@ -332,33 +421,56 @@ for ifo in args.single_trigger_files.keys():
 
     special_idx = args.special_trigger_ids[ifo]
     logging.info("Special idx %d for ifo %s", args.special_trigger_ids[ifo], ifo)
-    
+
     params = template_params(bankf, trigs.trigs['template_id'][special_idx])
 
     shifted_t, ncomp, harmonics = compute_harmonic_waveform(trigs, special_idx, ifo, args.merge_psd_files[ifo], args.sample_rate, args.segment_length, args.f_lower, args.inspiral_segments, args.data_read_name, args.data_analyzed_name, args.segment_start_pad, args.segment_end_pad, args.pad_data)
 
-    ###Zoom-in automatically. Again a crappy way! Improve it !!
-    threshold = 1e-2  # or something data-specific
-    nonzero_indices = numpy.where(numpy.abs(shifted_t) > threshold)[0]
-    i_min, i_max = nonzero_indices[0], nonzero_indices[-1]
+    # CHANGED: plotting block below replaces the single-panel plot
+    t = numpy.asarray(shifted_t.sample_times)
+    y = shifted_t.numpy()
+    merger_time = t[numpy.abs(y).argmax()]
+    zoom_lo, zoom_hi = merger_time - args.zoom_before, merger_time + args.zoom_after
+    # left panels: inspiral only, stopping where the zoom panels start
+    full_lo, full_hi = merger_time - args.window_before, zoom_lo
 
-    axs[axs_count].plot(shifted_t.sample_times[i_min:i_max], shifted_t[i_min:i_max], label="Full waveform")
+    ax_full, ax_zoom = axs[row, 0], axs[row, 1]
+    for ax, lo, hi in ((ax_full, full_lo, full_hi), (ax_zoom, zoom_lo, zoom_hi)):
+        m = (t >= lo) & (t <= hi)
+        ax.plot(t[m], y[m], color='gray')
+        ax.set_xlim(lo, hi)
+        ax.grid(alpha=0.3)
+    ax_full.set_ylabel('whitened h(t) (arb.)')
+    ax_full.set_title('%s: %d-harmonic grid-bestfit reconstruction' % (ifo, ncomp))
+
+    ax_harm_full, ax_harm_zoom = axs[row + 1, 0], axs[row + 1, 1]
     for idx, harm in enumerate(harmonics):
-        axs[axs_count].plot(harm.sample_times[i_min:i_max], harm[i_min:i_max], linestyle=':', label=f"Harmonic {idx+1}")
-    axs[axs_count].set_title('{}: {}-harmonic plot'.format(ifo, ncomp))
-    axs[axs_count].set_xlabel('time (s)')
-    axs[axs_count].set_ylabel("Scaled $h(t)$")
-    max_val = abs(shifted_t.data).argmax()
-    max_time = shifted_t.sample_times[max_val]
-    axs[axs_count].set_xlim([-0.7, 0.2])
-    axs[axs_count].legend()
-    axs[axs_count].grid()
-    axs_count += 1
+        ht = numpy.asarray(harm.sample_times)
+        hv = harm.numpy()
+        # harmonic 1 furthest back and lightest, later harmonics layered on top
+        alpha = 0.35 + 0.65 * (idx / max(len(harmonics) - 1, 1))
+        for ax, lo, hi in ((ax_harm_full, full_lo, full_hi),
+                           (ax_harm_zoom, zoom_lo, zoom_hi)):
+            m = (ht >= lo) & (ht <= hi)
+            ax.plot(ht[m], hv[m], linestyle='-', zorder=idx + 1,
+                    alpha=alpha, label='Harmonic %d' % (idx + 1))
+    for ax, lo, hi in ((ax_harm_full, full_lo, full_hi),
+                       (ax_harm_zoom, zoom_lo, zoom_hi)):
+        ax.set_xlim(lo, hi)
+        ax.set_xlabel('Time [s]')
+        ax.grid(alpha=0.3)
+    ax_harm_full.set_ylabel('whitened h(t) (arb.)')
+    ax_harm_full.legend(ncol=min(ncomp, 3), fontsize=8)
+
+    row += 2
 
 logging.info("Saving figure")
 pycbc.results.save_fig_with_metadata(fig, args.output_file,
             cmd = ' '.join(sys.argv),
-            title = '{}-harmonic plot'.format(ncomp),
-            caption = '', fig_kwds={'dpi': 300}
+            title = 'Grid-bestfit harmonic reconstruction',
+            caption = 'Best-fit-orientation (marginalization grid) reconstructed '
+                      'waveform (top) and its individual harmonic contributions '
+                      '(bottom), for each requested trigger.',
+            fig_kwds={'dpi': 300}
          )
 logging.info("Done!")

@@ -16,6 +16,11 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 """ Calculate the SNR and CHISQ timeseries for either a chosen template, or
 a specific Nth loudest coincident event.
+
+CHANGED (marked "# CHANGED"; only --use-tha-trigger-as-template is affected):
+the template is built from the best grid point's weights <e_k|h_hat> (as in the
+search chisq and the plot), not the trigger's snr_comp_k/coa_phase_comp_k, using
+the PSD of the trigger's segment, with the chisq-bin count taken from the bank.
 """
 import sys
 import logging
@@ -32,6 +37,8 @@ from pycbc.types import zeros, complex64
 from pycbc.types import complex_same_precision_as
 from pycbc.detector import Detector
 import pycbc.waveform.utils
+import pycbc.waveform.bank as bank  # CHANGED
+from pycbc.waveform.tha_marg_grid import get_interpolated_hp_hc  # CHANGED
 
 def subtract_template(stilde, template, snr, trigger_time, flow):
     idx = int((trigger_time - snr.start_time) / snr.delta_t)
@@ -41,6 +48,21 @@ def subtract_template(stilde, template, snr, trigger_time, flow):
         dt = trigger_time - snr.start_time
         stilde -= pycbc.waveform.utils.apply_fseries_time_shift(inverse, dt)
     return stilde
+
+def gridpoint_weights(trigs, i, phenom, harmonics, ncomp, psd, seg_len):
+    """CHANGED (new): c_k = <e_k|h_hat> at the trigger's best grid point
+    (unit-normalised; same maths as the plotting script)."""
+    th, al, ps = [float(trigs.trigs[k][i]) for k in ('marg_theta', 'marg_alpha', 'marg_psi')]
+    df = 1.0 / seg_len
+    hp, hc = get_interpolated_hp_hc(phenom, th, al, 0., df, phenom.f_final)
+    d = ps - bank._dpsi(th, al, phenom.beta)
+    hs = [hp * numpy.cos(2 * d) - hc * numpy.sin(2 * d)]
+    k0, k1 = int(phenom.flow / df), int(phenom.f_final / df)
+    phenom.whiten_and_normalize(hs, psd ** 0.5, len(hs[0]), df, k0, k1)
+    c = numpy.array([numpy.vdot(numpy.asarray(e.data)[k0:k1], numpy.asarray(hs[0].data)[k0:k1])
+                     for e in harmonics[:ncomp]])
+    return c / numpy.sum(numpy.abs(c) ** 2) ** 0.5
+
 
 def select_segments(fname, anal_name, data_name, ifo, time, pad_data):
     anal_segs = events.select_segments_by_definer(fname, anal_name, ifo)
@@ -314,8 +336,11 @@ with ctx:
         template = waveform.td_waveform_to_fd_waveform(td_template, length=flen)
         template = template.astype(complex_same_precision_as(segments[0]))
     elif opt.use_tha_trigger_as_template:
-        # Probably shouldn't be segments[0]
-        stilde = segments[0]
+        # CHANGED: segment containing the trigger (was segments[0]; the harmonics'
+        # whitening/orthogonalisation depends on the segment's PSD)
+        _sr = float(opt.sample_rate)
+        stilde = next((g for g in segments if g.epoch + g.analyze.start / _sr
+                       < opt.trigger_time < g.epoch + g.analyze.stop / _sr), segments[0])
         from pycbc.waveform.bank import PhenomXPTemplate
         # Generating template from trigger list
         trigs = SingleDetTriggers(
@@ -324,27 +349,12 @@ with ctx:
             bank_file=opt.bank_file,
         )
         special_idx = opt.special_trigger_id
-        norm_snr = 0.0
-        #Get the total SNR
-        for i in range(5):
-            key = 'snr_comp_{}'.format(i+1)
-            norm_snr += trigs.trigs[key][special_idx]**2
-        norm_snr = numpy.sqrt(norm_snr)
-
-        amplitudes_dict = {}
-        phases_dict = {}
-
-        for i in range(5):
-            key = 'snr_comp_{}'.format(i+1)
-            phase_key = 'coa_phase_comp_{}'.format(i+1)
-            amplitudes_dict[i] = trigs.trigs[key][special_idx]/norm_snr
-            phases_dict[i] = trigs.trigs[phase_key][special_idx]
-
+        # CHANGED: removed the snr_comp_k/coa_phase_comp_k amplitude/phase dicts
         bad_tempid = trigs.trigs['template_id'][special_idx]
         ncomp = trigs.bank['num_comps'][bad_tempid]
         # FIXME: Harcoding max num_comps for now
-        if ncomp > 3:
-            ncomp = 3
+        if ncomp > 5:
+            ncomp = 5
 
         class template_params:
             def __init__(self, bank, x):
@@ -361,14 +371,20 @@ with ctx:
             num_comps=ncomp,
         )
 
+        # CHANGED: weights from the best grid point; row (chisq-bin count) from the bank
+        c_k = gridpoint_weights(trigs, special_idx, phenom_object, harmonics,
+                                ncomp, stilde.psd, opt.segment_length)
+        logging.info("grid-point weights |c_k| = %s", numpy.abs(c_k))
+        row = WaveformArray.from_kwargs(**{k: getattr(params, k, 0) for k in
+            ('mass1', 'mass2', 'spin1x', 'spin1y', 'spin1z', 'spin2x', 'spin2y', 'spin2z')})
         template = None
         for harm_idx, harm in enumerate(harmonics):
             if harm_idx == ncomp:
                 break
             if template is not None:
-                template += amplitudes_dict[harm_idx] * harm * numpy.exp(1j * phases_dict[harm_idx])
+                template += harm * complex(c_k[harm_idx])  # CHANGED
             else:
-                template = amplitudes_dict[harm_idx] * harm * numpy.exp(1j * phases_dict[harm_idx])
+                template = harm * complex(c_k[harm_idx])  # CHANGED
 
         # Don't want whitened template
         template = template * (stilde.psd.data[:]**0.5)
@@ -477,6 +493,11 @@ with ctx:
         chisq, raw_bin = vetoes.power_chisq(template, stilde, chisq_bins, stilde.psd,
                                     low_frequency_cutoff=flow,
                                     return_bins=True)
+        if opt.trigger_time is not None and start < opt.trigger_time < end:  # CHANGED: check
+            _t = int((opt.trigger_time - snr.start_time) / snr.delta_t)
+            _w = numpy.abs(snr.numpy()[_t - 100:_t + 100]); _j = _t - 100 + _w.argmax()
+            logging.info("CHECK at trigger: peak |SNR| = %.3f (cf. marg_snr), chisq = %.3f "
+                         "(unreduced), dof = %d", _w.max(), chisq.numpy()[_j], chisq_bins * 2 - 2)
         chisq /= chisq_bins * 2 - 2
 
         snrs.append(snr[stilde.analyze])

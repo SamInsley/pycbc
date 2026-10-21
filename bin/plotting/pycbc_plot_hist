@@ -68,7 +68,19 @@ trigs = pycbc.io.SingleDetTriggers(
 )
 
 # get x values and find the maximum x value
-val = getattr(trigs, args.x_var)
+#
+# Not every valid --x-var name is a SingleDetTriggers attribute --
+# SingleDetTriggers only has @property definitions for a fixed set of
+# columns (snr, end_time, newsnr, rchisq, ...). Statistics registered
+# in ranking.sngls_ranking_function_dict (e.g. marg_newsnr, marg_snr,
+# newsnr_sgveto_psdvar, ...) are only reachable through
+# ranking.get_sngls_ranking_from_trigs, the same generic dispatcher
+# already used above (via xv) to pick the presort filter -- so reuse
+# that same membership check here instead of assuming getattr works.
+if args.x_var in ranking.sngls_ranking_function_dict:
+    val = ranking.get_sngls_ranking_from_trigs(trigs, args.x_var)
+else:
+    val = getattr(trigs, args.x_var)
 x_max = args.x_max if args.x_max else val.max() * 1.1
 
 # create a figure to add a histogram
@@ -160,4 +172,3 @@ pycbc.results.save_fig_with_metadata(fig, args.output_file,
                 title = '%s: %s histogram of single detector triggers' % (ifo, args.x_var),
                 caption = 'Histogram of single detector triggers',
                 cmd = ' '.join(sys.argv))
-

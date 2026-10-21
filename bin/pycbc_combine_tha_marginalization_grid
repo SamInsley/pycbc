@@ -49,30 +49,40 @@ pycbc.init_logging(opt.verbose)
 if len(opt.input_files) < 2:
     parser.error('--input-files needs at least two files to combine.')
 
-template_hash_parts = []
-A_parts = []
-B_parts = []
-beta_parts = []
+# ---- pass 1: check attrs, collect shapes and hashes (small) ----
 ref_attrs = None
+ref_shapes = None
+counts_per_file = []
+template_hash_parts = []
+have_mr = []
 start_indices = []
 end_indices = []
 
 for path in opt.input_files:
-    logging.info("Reading %s", path)
+    logging.info("Checking %s", path)
     with HFile(path, 'r') as f:
         attrs = dict(f.attrs)
+        shapes = {k: (f[k].shape[1:], f[k].dtype) for k in ('A', 'B', 'beta')}
 
         if ref_attrs is None:
             ref_attrs = attrs
+            ref_shapes = shapes
         else:
             mismatches = [
                 name for name in _SCALAR_ATTRS_MUST_MATCH
                 if attrs.get(name) != ref_attrs.get(name)]
             for name in _ARRAY_ATTRS_MUST_MATCH:
-                if not np.array_equal(
-                        np.asarray(attrs.get(name)),
-                        np.asarray(ref_attrs.get(name))):
+                # Tolerant comparison: files built by different jobs/machines
+                # can differ by floating-point roundoff (~1e-16) in these
+                # derived arrays while being the same grid.
+                a1 = np.asarray(attrs.get(name))
+                a2 = np.asarray(ref_attrs.get(name))
+                if a1.shape != a2.shape or not np.allclose(
+                        a1, a2, rtol=1e-12, atol=1e-12):
                     mismatches.append(name)
+            for k in shapes:
+                if shapes[k][0] != ref_shapes[k][0]:
+                    mismatches.append(k + ' shape')
             if mismatches:
                 raise ValueError(
                     "{} was generated with different options than {}: "
@@ -83,14 +93,20 @@ for path in opt.input_files:
                     .format(path, opt.input_files[0],
                             ", ".join(mismatches)))
 
+        n = len(f['template_hash'])
+        counts_per_file.append(n)
         template_hash_parts.append(f['template_hash'][:])
-        A_parts.append(f['A'][:])
-        B_parts.append(f['B'][:])
-        beta_parts.append(f['beta'][:])
+        have_mr.append('max_response' in f)
+        if have_mr[-1]:
+            ref_shapes['max_response'] = (f['max_response'].shape[1:],
+                                          f['max_response'].dtype)
         start_indices.append(int(attrs['start_index']))
         end_indices.append(int(attrs['end_index']))
 
 template_hash = np.concatenate(template_hash_parts)
+del template_hash_parts
+n_total = len(template_hash)
+
 uniq, counts = np.unique(template_hash, return_counts=True)
 dupes = uniq[counts > 1]
 if len(dupes):
@@ -102,19 +118,39 @@ if len(dupes):
         "mistake in how --start-index/--end-index or --job-index were "
         "chosen.", len(dupes), dupes[:5].tolist())
 
-with HFile(opt.output, 'w') as f:
-    f.create_dataset('template_hash', data=template_hash)
-    f.create_dataset('A', data=np.concatenate(A_parts, axis=0))
-    f.create_dataset('B', data=np.concatenate(B_parts, axis=0))
-    f.create_dataset('beta', data=np.concatenate(beta_parts, axis=0))
+write_mr = all(have_mr)
+if any(have_mr) and not write_mr:
+    logging.warning("Only some input files contain 'max_response'; "
+                    "it is NOT written to the combined file.")
+
+datasets = ['A', 'B', 'beta'] + (['max_response'] if write_mr else [])
+
+# ---- pass 2: stream each input into its slice of the output ----
+with HFile(opt.output, 'w') as fout:
+    fout.create_dataset('template_hash', data=template_hash)
+    out = {}
+    for k in datasets:
+        tail, dtype = ref_shapes[k]
+        out[k] = fout.create_dataset(
+            k, shape=(n_total,) + tuple(tail), dtype=dtype)
+
+    offset = 0
+    for i, (path, n) in enumerate(zip(opt.input_files, counts_per_file)):
+        logging.info("Copying %s (%d/%d, %d templates)",
+                     path, i + 1, len(opt.input_files), n)
+        with HFile(path, 'r') as f:
+            for k in datasets:
+                out[k][offset:offset + n] = f[k][:]
+        offset += n
+
     for name in _ARRAY_ATTRS_MUST_MATCH:
-        f.attrs[name] = ref_attrs[name]
+        fout.attrs[name] = ref_attrs[name]
     for name in _SCALAR_ATTRS_MUST_MATCH:
-        f.attrs[name] = ref_attrs[name]
+        fout.attrs[name] = ref_attrs[name]
     # start_index/end_index no longer describe a single contiguous slice
     # once combined; keep the overall span for information only.
-    f.attrs['start_index'] = min(start_indices)
-    f.attrs['end_index'] = max(end_indices)
+    fout.attrs['start_index'] = min(start_indices)
+    fout.attrs['end_index'] = max(end_indices)
 
 logging.info("Wrote %d templates (from %d input files) to %s",
-             len(template_hash), len(opt.input_files), opt.output)
+             n_total, len(opt.input_files), opt.output)

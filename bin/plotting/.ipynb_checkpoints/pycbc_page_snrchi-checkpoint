@@ -31,6 +31,19 @@ parser.add_argument(
 parser.add_argument('--chisq-choice', choices=chisq_choices,
                     default='traditional',
                     help='Which chisquared to plot. Default=traditional')
+parser.add_argument('--x-var', default='snr',
+                    choices=['snr', 'marg_lnl'],
+                    help="Which quantity to plot on the x-axis. 'snr' "
+                    "(default): the ordinary matched-filter SNR. "
+                    "'marg_lnl': the marginalized-likelihood-derived "
+                    "SNR-equivalent sqrt(2*marg_lnl) (same conversion "
+                    "ranking.marg_newsnr uses internally) -- requires "
+                    "the trigger file to have a marg_lnl column (i.e. "
+                    "the run used --marginalized-grid-file). Triggers "
+                    "where the resulting value is NaN or <= 0 (e.g. no "
+                    "marginalization grid coverage for that template) "
+                    "are dropped, since a log-scale x-axis cannot show "
+                    "them.")
 args = parser.parse_args()
 
 pycbc.init_logging(args.verbose, default_level=1)
@@ -50,9 +63,19 @@ args.newsnr_contours = \
 with HFile(args.trigger_file, 'r') as f:
     ifo = tuple(f.keys())[0]
     n_triggers = f[ifo]['snr'].size
+    if args.x_var == 'marg_lnl' and 'marg_lnl' not in f[ifo]:
+        parser.error(
+            "--x-var marg_lnl requires a 'marg_lnl' column in "
+            "--trigger-file, but it is missing from {}. This file was "
+            "likely produced by a run that didn't use "
+            "--marginalized-grid-file (or predates it) -- either rerun "
+            "with that option, or drop --x-var marg_lnl to fall back to "
+            "plain SNR.".format(args.trigger_file)
+        )
 
 logging.info(
-    "Plotting SNR vs %s chisq for %s triggers",
+    "Plotting %s vs %s chisq for %s triggers",
+    args.x_var,
     args.chisq_choice,
     ifo
 )
@@ -77,12 +100,54 @@ trigs = SingleDetTriggers(
 )
 
 logging.info(
-    "Reading SNR and %s chisq for %d triggers",
+    "Reading %s and %s chisq for %d triggers",
+    args.x_var,
     args.chisq_choice,
     trigs.mask_size
 )
-snr = trigs.snr
 chisq = get_chisq_from_file_choice(trigs, args.chisq_choice)
+
+_PRETTY_X_LABELS = {
+    'snr': 'Signal-to-Noise Ratio',
+    'marg_lnl': r'Marginalized-Likelihood SNR $\sqrt{2\,\ln\mathcal{L}_{\rm marg}}$',
+}
+
+if args.x_var == 'snr':
+    snr = trigs.snr
+else:  # 'marg_lnl'
+    # sqrt(2*marg_lnl) is the same SNR-equivalent conversion
+    # ranking.marg_newsnr uses internally -- marg_lnl is the raw
+    # log-likelihood at the trigger's best-fit marginalization grid
+    # point (theta_jn, alpha0, psi), so this puts it on the same
+    # footing as an ordinary matched-filter SNR for this plot.
+    #
+    # marg_lnl has no @property on SingleDetTriggers (only a fixed set
+    # of columns, e.g. snr/chisq/psd_var_val, get one), so it can't be
+    # accessed as trigs.marg_lnl -- but get_column() is the same
+    # mask-aware column reader every one of those properties delegates
+    # to internally, and it works for any column name actually present
+    # in the trigger file, so call it directly instead.
+    marg_lnl = trigs.get_column('marg_lnl')
+    with numpy.errstate(invalid='ignore'):
+        snr = numpy.sqrt(2. * marg_lnl)
+
+snr_label = _PRETTY_X_LABELS[args.x_var]
+
+# Triggers where the chosen x-quantity is NaN (marg_lnl: no
+# marginalization grid coverage for that template) or <= 0 can't be
+# shown on a log-scale x-axis -- drop them rather than letting them
+# silently corrupt chisq.min()/snr.min() (NaN propagates through
+# those) or the hexbin call.
+keep = numpy.isfinite(snr) & (snr > 0)
+n_dropped = len(snr) - int(keep.sum())
+if n_dropped:
+    logging.info(
+        "Dropping %d/%d triggers with non-finite or non-positive %s "
+        "-- not representable on a log x-axis",
+        n_dropped, len(snr), args.x_var
+    )
+snr = snr[keep]
+chisq = chisq[keep]
 
 
 def snr_from_chisq(chisq, newsnr, q=6.):
@@ -121,12 +186,13 @@ cb = pylab.colorbar()
 pylab.xlim(snr.min(), snr.max() * 1.1)
 pylab.ylim(chisq.min(), chisq.max() * 1.1)
 cb.set_label('Trigger Density')
-pylab.xlabel('Signal-to-Noise Ratio')
+pylab.xlabel(snr_label)
 pylab.ylabel('Reduced $\\chi^2$')
-pycbc.results.save_fig_with_metadata(fig, args.output_file, 
-     title="%s :SNR vs Reduced %s &chi;<sup>2</sup>" % (ifo, args.chisq_choice),
-     caption="Distribution of SNR and %s &chi;&sup2; for single detector triggers: "
+
+pycbc.results.save_fig_with_metadata(fig, args.output_file,
+     title="%s :%s vs Reduced %s &chi;<sup>2</sup>" % (ifo, snr_label, args.chisq_choice),
+     caption="Distribution of %s and %s &chi;&sup2; for single detector triggers: "
              "Black lines show contours of constant NewSNR." \
-              %(args.chisq_choice,),
+              % (snr_label, args.chisq_choice),
      cmd=' '.join(sys.argv),
      fig_kwds={'dpi':300})

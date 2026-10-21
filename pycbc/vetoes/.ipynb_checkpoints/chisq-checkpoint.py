@@ -585,7 +585,56 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
         template.params = templates[0].params
         return template, scales
 
-    def _bestfit_M_row(self, grid, raws, segment_psd, ta_idx, psi):
+    def _compute_ep_ec(self, grid, raws, segment_psd):
+        """Compute Ep/Ec for the WHOLE marginalization grid at once (one
+        row per (theta_jn, alpha0) grid point), for this template's raw
+        harmonics and this segment's PSD.
+
+        This is the expensive part of what used to be `_bestfit_M_row`
+        (a 5x5 Gram-matrix build over every frequency bin, plus a
+        (n_grid, 5) x (5, 5) matrix product against the WHOLE grid's
+        A/B) -- but it depends only on `raws`/`grid`/`segment_psd`, i.e.
+        only on the template and the segment, NOT on any individual
+        trigger's winning grid point. So it must be called exactly ONCE
+        per values() call (one template, one segment), not once per
+        trigger -- see _bestfit_row_from_ep_ec for the actual per-trigger
+        work (a cheap single-row lookup + rotation).
+
+        Parameters
+        ----------
+        grid : dict
+            One entry of tha_marginalize.load_raw_grid_file's return
+            (the SAME `grid` used for this template's marg_lnl
+            computation in pycbc_inspiral_tha) -- needs 'A', 'B', 'df',
+            'kmin', 'kmax'.
+        raws : list of 5 (n_freq,) complex arrays
+            The raw (unwhitened) harmonics for this template -- the SAME
+            `raws` passed to tha_marginalize.marginalize_for_psd for this
+            segment (bank.curr_tmp.h1..h5, zero-padded to segment_psd's
+            length).
+        segment_psd : (n_freq,) float array
+            The SAME un-scaled PSD passed to marginalize_for_psd for this
+            segment (i.e. stilde.psd / DYN_RANGE_FAC**2, NOT the
+            DYN_RANGE_FAC-scaled stilde.psd used for ordinary whitening)
+            -- using this exact PSD is what makes Ep/Ec reproduce the
+            SAME values that picked out each trigger's grid point as the
+            best fit in the first place.
+
+        Returns
+        -------
+        Ep, Ec : (n_grid, 5) complex arrays
+            Whole-grid Ep/Ec, as returned by
+            tha_marginalize.derive_ep_ec_hh (hh_pp/hh_cc/hh_pc dropped --
+            not needed here).
+        """
+        from pycbc.filter.tha_marginalize import derive_ep_ec_hh
+
+        Ep, Ec, _hh_pp, _hh_cc, _hh_pc = derive_ep_ec_hh(
+            raws, grid['A'], grid['B'], segment_psd,
+            grid['df'], grid['kmin'], grid['kmax'])
+        return Ep, Ec
+
+    def _bestfit_row_from_ep_ec(self, grid, Ep, Ec, ta_idx, psi):
         """The (5,) complex row of the marginalization grid's M matrix
         for one specific (theta_jn, alpha0) grid point (`ta_idx`) and an
         arbitrary `psi`, i.e. the coefficients c_k such that the
@@ -595,12 +644,10 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
         this is what values() below feeds into reconstruct_template as
         `weights`.
 
-        This is the single-grid-point version of
-        tha_marginalize.derive_ep_ec_hh + fold_psi: those build the M
-        row (and hh) for every grid point at once (needed for the
-        marginalization sum over the whole grid), but here we already
-        know which one point we want, so we only need Ep/Ec at that one
-        (theta_jn, alpha0) index, rotated by the given psi.
+        Cheap: just a single-row lookup into the already-computed
+        whole-grid Ep/Ec (see _compute_ep_ec, called once per template
+        per segment, not per trigger) plus a real rotation by psi -- the
+        only things here that vary per trigger.
 
         By linearity of correlation, the SAME coefficients (once
         renormalized by reconstruct_template) combine the
@@ -613,27 +660,15 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
         Parameters
         ----------
         grid : dict
-            One entry of tha_marginalize.load_raw_grid_file's return
-            (the SAME `grid` used for this template's marg_lnl
-            computation in pycbc_inspiral_tha) -- needs 'A', 'B', 'dpsi',
-            'df', 'kmin', 'kmax'.
-        raws : list of 5 (n_freq,) complex arrays
-            The raw (unwhitened) harmonics for this template -- the SAME
-            `raws` passed to tha_marginalize.marginalize_for_psd for this
-            segment (bank.curr_tmp.h1..h5, zero-padded to segment_psd's
-            length).
-        segment_psd : (n_freq,) float array
-            The SAME un-scaled PSD passed to marginalize_for_psd for this
-            segment (i.e. stilde.psd / DYN_RANGE_FAC**2, NOT the
-            DYN_RANGE_FAC-scaled stilde.psd used for ordinary whitening)
-            -- using this exact PSD is what makes the M row reproduce
-            the SAME Ep/Ec/M that picked out this grid point as the
-            best fit in the first place.
+            Needs 'dpsi' (per-grid-point psi offset).
+        Ep, Ec : (n_grid, 5) complex arrays
+            This template/segment's whole-grid Ep/Ec, from
+            _compute_ep_ec.
         ta_idx : int
-            Index into grid['A']/['B']/['dpsi'] for the winning
-            (theta_jn, alpha0) grid point (out_vals['marg_ta_idx']).
-            Must not be -1 (the "no grid coverage" sentinel) -- callers
-            check that themselves (see values()).
+            Index into grid['dpsi']/Ep/Ec for the winning (theta_jn,
+            alpha0) grid point (out_vals['marg_ta_idx']). Must not be -1
+            (the "no grid coverage" sentinel) -- callers check that
+            themselves (see values()).
         psi : float
             The best-fit psi for this trigger (out_vals['marg_psi']) --
             entering only through a smooth cos(2*(psi-dpsi))/
@@ -645,12 +680,6 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
         M_row : (5,) complex array
             c_k coefficients, ordered to match `templates`/`corrs`.
         """
-        from pycbc.waveform.tha_marginalize import derive_ep_ec_hh
-
-        Ep, Ec, _hh_pp, _hh_cc, _hh_pc = derive_ep_ec_hh(
-            raws, grid['A'], grid['B'], segment_psd,
-            grid['df'], grid['kmin'], grid['kmax'])
-
         dpsi_i = grid['dpsi'][ta_idx]
         delta = psi - dpsi_i
         c2, s2 = numpy.cos(2. * delta), numpy.sin(2. * delta)
@@ -666,8 +695,8 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
         weights used to build that template): the only thing that has
         changed is where the per-harmonic weights fed into
         reconstruct_template come from -- the best-fit marginalization
-        grid point's analytic coefficients (_bestfit_M_row), instead of
-        the trigger's own measured per-harmonic SNRs.
+        grid point's analytic coefficients (_bestfit_row_from_ep_ec),
+        instead of the trigger's own measured per-harmonic SNRs.
 
         Parameters
         ----------
@@ -695,9 +724,9 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
             This template's PSD-independent marginalization grid data
             (the SAME `grid` used for marg_lnl in pycbc_inspiral_tha).
         raws : list of 5 (n_freq,) complex arrays
-            This template's live raw harmonics (see _bestfit_M_row).
+            This template's live raw harmonics (see _compute_ep_ec).
         segment_psd : (n_freq,) float array
-            This segment's un-scaled PSD (see _bestfit_M_row).
+            This segment's un-scaled PSD (see _compute_ep_ec).
         ta_idx, psi : Array
             Per-trigger best-fit grid-point values
             (out_vals['marg_ta_idx']/['marg_psi'] from
@@ -736,6 +765,21 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
                 scales = []
                 covered = []
                 num_comps = len([t for t in templates if t is not None])
+
+                # Whole-grid Ep/Ec depends only on raws/grid/segment_psd
+                # -- the same for every trigger of this template in this
+                # segment -- so it's computed exactly ONCE here, outside
+                # the per-trigger loop below, instead of being
+                # recalculated (Gram matrix + full (n_grid, 5) matrix
+                # products) once per trigger. Only computed at all if
+                # there's a grid for this template; if grid is None,
+                # every ta_idx below will be -1 (see pycbc_inspiral_tha)
+                # and Ep/Ec are never read.
+                if grid is not None:
+                    Ep, Ec = self._compute_ep_ec(grid, raws, segment_psd)
+                else:
+                    Ep = Ec = None
+
                 for lidx, index in enumerate(above_indices):
                     ta = int(above_ta_idx[lidx])
                     if ta == -1:
@@ -751,8 +795,8 @@ class SingleDetTHAPowerChisq(SingleDetPowerChisq):
                         scales += [numpy.zeros(num_comps, dtype=complex)]
                         continue
                     covered.append(True)
-                    m_row = self._bestfit_M_row(
-                        grid, raws, segment_psd, ta, above_psi[lidx])
+                    m_row = self._bestfit_row_from_ep_ec(
+                        grid, Ep, Ec, ta, above_psi[lidx])
                     # m_row is M[ta_idx,:] (same M as tha_marginalize's
                     # dh = M @ z), NOT the physical combination
                     # coefficients directly: <h_recon|data> = Sum_k

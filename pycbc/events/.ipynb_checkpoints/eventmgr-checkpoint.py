@@ -484,6 +484,21 @@ class EventManager(object):
                 f['coa_phase_comp_5'] = numpy.angle(self.events['snr_comp_5'])
             if 'marg_lnl' in self.events.dtype.names:
                 f['marg_lnl'] = self.events['marg_lnl']
+            if 'marg_theta' in self.events.dtype.names:
+                # Best-fit (theta_jn, alpha0, psi) marginalization grid
+                # point for this trigger (see
+                # tha_marginalize.marginalize_for_psd's return_bestfit),
+                # plus the SNR/phase of the data projected onto that
+                # point's filter, and marg_ta_idx (the exact grid-index
+                # identifier chisq.py uses to reconstruct the same
+                # filter -- see pycbc_inspiral_tha). NaN/-1 for triggers
+                # with no marginalization grid coverage.
+                f['marg_theta'] = self.events['marg_theta']
+                f['marg_alpha'] = self.events['marg_alpha']
+                f['marg_psi'] = self.events['marg_psi']
+                f['marg_snr'] = self.events['marg_snr']
+                f['marg_phase'] = self.events['marg_phase']
+                f['marg_ta_idx'] = self.events['marg_ta_idx']
             if 'cont_chisq' in self.events.dtype.names:
                 f['cont_chisq'] = self.events['cont_chisq']
                 # FIXME: Can we get this value from the autochisq instance?

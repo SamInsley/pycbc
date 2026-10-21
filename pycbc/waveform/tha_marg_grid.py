@@ -101,10 +101,15 @@ def get_raw_harmonics(tmpl, df, f_final, kmin, kmax, interp=False):
     comps = tmpl.compute_waveform_five_comps(df, f_final, interp=interp)
     if tmpl.reverse_flag:
         comps = comps[::-1]
+    # Aligned-spin templates return only the leading harmonic (the rest
+    # None); represent the missing ones as all-zero arrays so there are
+    # always 5 raws.
+    n_freq = len(comps[0])
     raws = []
     for h in comps:
-        arr = np.zeros(len(h), dtype=np.complex128)
-        arr[kmin:kmax] = h.data[kmin:kmax]
+        arr = np.zeros(n_freq, dtype=np.complex128)
+        if h is not None:
+            arr[kmin:kmax] = h.data[kmin:kmax]
         raws.append(arr)
     return raws
 
@@ -140,7 +145,11 @@ def compute_raw_and_ab(template_params, sample_rate, f_lower, df, f_final,
     """
     tmpl = PhenomXPTemplate(template_params, sample_rate, f_lower)
     raws = get_raw_harmonics(tmpl, df, f_final, kmin, kmax, interp=interp)
-    Graw_ref = raw_gram_matrix(raws, ref_psd, df, kmin, kmax)
+    # Aligned-spin templates only have harmonic 1 (raws 2-5 are zero), so
+    # solve for A, B in that 1-harmonic subspace; the 5x5 Gram matrix would
+    # be singular. Columns 2-5 of A and B stay zero.
+    n_used = 1 if tmpl.is_aligned else 5
+    Graw_ref = raw_gram_matrix(raws[:n_used], ref_psd, df, kmin, kmax)
 
     n_grid = len(theta_grid)
     A = np.zeros((n_grid, 5), dtype=np.complex128)
@@ -165,10 +174,10 @@ def compute_raw_and_ab(template_params, sample_rate, f_lower, df, f_final,
         hc_raw[kmin:kmax] = hc_fs.data[kmin:kmax]
 
         c_p = np.array([weighted_correlation(v, hp_raw, ref_psd, df, kmin, kmax)
-                        for v in raws])
+                        for v in raws[:n_used]])
         c_c = np.array([weighted_correlation(v, hc_raw, ref_psd, df, kmin, kmax)
-                        for v in raws])
-        A[i, :] = np.linalg.solve(Graw_ref, c_p)
-        B[i, :] = np.linalg.solve(Graw_ref, c_c)
+                        for v in raws[:n_used]])
+        A[i, :n_used] = np.linalg.solve(Graw_ref, c_p)
+        B[i, :n_used] = np.linalg.solve(Graw_ref, c_c)
 
     return tmpl, raws, A, B

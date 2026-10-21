@@ -39,6 +39,8 @@ parser.add_argument('--cluster-window', type=float,
                     help='Window (seconds) during which to keep the trigger '
                          'with the loudest statistic value. '
                          'Default=do not cluster')
+parser.add_argument("--minimum-stat", type=float,
+                    help="Minimum statistic value to store.")
 parser.add_argument("--output-file",
                     help="File to store the candidate triggers")
 parser.add_argument("--loudest-keep-values",
@@ -187,6 +189,11 @@ for i, tnum in enumerate(template_ids):
         stat_t = stat_t[cid]
         tids_full = tids_full[cid]
         trigger_times = trigger_times[cid]
+    if args.minimum_stat is not None:
+        keep = stat_t >= args.minimum_stat
+        stat_t = stat_t[keep]
+        tids_full = tids_full[keep]
+        trigger_times = trigger_times[keep]
 
     trigger_ids_all += list(tids_full)
     template_ids_all += list(tnum * np.ones_like(tids_full))

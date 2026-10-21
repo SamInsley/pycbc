@@ -51,8 +51,15 @@ parser.add_argument('--bank-file', required=True,
 parser.add_argument('--veto-file', help='LIGOLW file containing veto segments')
 parser.add_argument('--f-low', type=float, default=20,
                     help='Low-frequency cutoff')
-parser.add_argument('--rank', choices=['snr', 'newsnr'], default='newsnr',
-                    help='Ranking statistic for sorting triggers')
+parser.add_argument('--rank', choices=['snr', 'newsnr', 'marg_newsnr'],
+                    default='newsnr',
+                    help='Ranking statistic for sorting triggers. '
+                    '"marg_newsnr" is newsnr built from the '
+                    'marginalized-likelihood SNR-equivalent instead of '
+                    'the ordinary matched-filter SNR (see '
+                    'pycbc.events.ranking.marg_newsnr) -- requires the '
+                    'trigger file to have a marg_lnl column (i.e. the '
+                    'run used --marginalized-grid-file).')
 parser.add_argument('--num-loudest', type=int, default=1000,
                     help='Number of loudest triggers to plot')
 parser.add_argument('--interesting-trig', type=int,
@@ -101,21 +108,40 @@ logging.info('Loading trigs')
 trig_f = HFile(opts.trig_file, 'r')
 trigs = trig_f[opts.detector]
 
-def rough_filter(snr, chisq, chisq_dof, end_time, tmp_id, tmp_dur):
+if opts.rank == 'marg_newsnr' and 'marg_lnl' not in trigs:
+    parser.error(
+        "--rank marg_newsnr requires a 'marg_lnl' column in "
+        "--trig-file, but it is missing from {}. This file was likely "
+        "produced by a run that didn't use --marginalized-grid-file "
+        "(or predates it) -- either rerun with that option, or use "
+        "--rank snr/newsnr instead.".format(opts.trig_file)
+    )
+
+def rough_filter(snr, chisq, chisq_dof, end_time, tmp_id, tmp_dur, *extra):
+    # *extra absorbs marg_lnl when it's requested as an additional
+    # select() column below -- it isn't used for the rough time filter
+    # itself, just needs to be accepted so select() can pass it through.
     return np.logical_and(end_time > opts.gps_start_time,
                           end_time < opts.gps_end_time + tmp_dur)
 
+select_columns = [
+    'snr', 'chisq', 'chisq_dof', 'end_time', 'template_id',
+    'template_duration',
+]
+if opts.rank == 'marg_newsnr':
+    select_columns.append('marg_lnl')
+
 indices, data_tuple = trig_f.select(
     rough_filter,
-    'snr',
-    'chisq',
-    'chisq_dof',
-    'end_time',
-    'template_id',
-    'template_duration',
+    *select_columns,
     group=opts.detector
 )
-snr, chisq, chisq_dof, end_time, template_ids, template_duration = data_tuple
+if opts.rank == 'marg_newsnr':
+    (snr, chisq, chisq_dof, end_time, template_ids, template_duration,
+     marg_lnl) = data_tuple
+else:
+    snr, chisq, chisq_dof, end_time, template_ids, template_duration = \
+        data_tuple
 
 if len(indices) > 0:
     if opts.veto_file:
@@ -128,6 +154,8 @@ if len(indices) > 0:
         chisq_dof = chisq_dof[locs]
         template_ids = template_ids[locs]
         indices = indices[locs]
+        if opts.rank == 'marg_newsnr':
+            marg_lnl = marg_lnl[locs]
         del locs
 
     if opts.rank == 'snr':
@@ -138,6 +166,12 @@ if len(indices) > 0:
         if type(rank) in [np.float32, np.float64]:
             rank = np.array([rank])
         del rchisq
+    elif opts.rank == 'marg_newsnr':
+        rchisq = chisq / (chisq_dof * 2 - 2)
+        rank = pycbc.events.ranking.marg_newsnr(marg_lnl, rchisq)
+        if type(rank) in [np.float32, np.float64]:
+            rank = np.array([rank])
+        del rchisq, marg_lnl
     del snr, chisq, chisq_dof
 
     sorter = np.argsort(rank)[::-1][:opts.num_loudest]

@@ -1169,7 +1169,9 @@ def _dpsi(theta_jn, phi_jl, beta):
     p_j /= np.linalg.norm(p_j)
     p_l = np.cross(n, l)
     p_l /= np.linalg.norm(p_l)
-    cosine = np.inner(p_j, p_l)
+    # Clip: for aligned spins (beta = 0) p_l == p_j and roundoff can push
+    # the inner product just above 1, which would make arccos return NaN.
+    cosine = np.clip(np.inner(p_j, p_l), -1., 1.)
     sine = np.inner(n, np.cross(p_j, p_l))
     dpsi = np.pi / 2 + np.sign(sine) * np.arccos(cosine)
     return dpsi
@@ -1200,10 +1202,15 @@ def _dphi(theta_jn, phi_jl, beta):
             np.cos(beta)
         ]
     )
-    cosi = [np.inner(nn, ll) for nn, ll in zip(n, l)]
+    cosi = np.clip([np.inner(nn, ll) for nn, ll in zip(n, l)], -1., 1.)
     inc = np.arccos(cosi)
     sign = np.sign(np.cos(theta_jn) - (np.cos(beta) * np.cos(inc)))
-    cos_d = np.cos(phi_jl) * np.sin(theta_jn) / np.sin(inc)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cos_d = np.cos(phi_jl) * np.sin(theta_jn) / np.sin(inc)
+    # L along the line of sight (sin(inc) = 0, e.g. aligned spins viewed
+    # face-on): the J- and L-frame phases coincide, so no rotation. Without
+    # this the 0/0 above gives NaN and the whole harmonic becomes NaN.
+    cos_d[~np.isfinite(cos_d)] = 1.
     inds = np.logical_or(cos_d < -1, cos_d > 1)
     cos_d[inds] = np.sign(cos_d[inds]) * 1.
     dphi = -1. * sign * np.arccos(cos_d)
@@ -1240,7 +1247,9 @@ def compute_beta(tmplt):
     jz = lmag + s1z + s2z
 
     jnorm = (jx * jx + jy * jy + jz * jz) ** (1. / 2.)
-    jhatz = jz / jnorm
+    # Clip: with no in-plane spin jnorm == |jz| up to roundoff, and a ratio
+    # of 1 + eps would make arccos return NaN instead of beta = 0.
+    jhatz = np.clip(jz / jnorm, -1., 1.)
 
     return np.arccos(jhatz)
 
@@ -1249,6 +1258,11 @@ def _rulog2(val):
     return 2.0 ** np.ceil(np.log2(float(val)))
 
 class _PhenomTemplate():
+
+    # A template whose in-plane spin magnitudes are both at or below this
+    # value is treated as aligned-spin: it has no precession (beta = 0), so
+    # only the leading harmonic exists and harmonics 2-5 are not generated.
+    ALIGNED_SPIN_TOL = 0.
 
     def __init__(self, template_params, sample_rate, f_lower):
         from pycbc.pnutils import get_imr_duration
@@ -1271,6 +1285,11 @@ class _PhenomTemplate():
         self.orb_phase = float(template_params.orbital_phase)
         self.fref = self.flow
         self.reverse_flag = int(template_params.reverse_flag)
+
+        self.is_aligned = (
+            np.hypot(self.spin1x, self.spin1y) <= self.ALIGNED_SPIN_TOL and
+            np.hypot(self.spin2x, self.spin2y) <= self.ALIGNED_SPIN_TOL
+        )
 
         self.duration = get_imr_duration(self.mass1, self.mass2, self.spin1z,
                                          self.spin2z, self.flow, "IMRPhenomD")
@@ -1300,6 +1319,20 @@ class _PhenomTemplate():
         self.psi_corr = zeta_polariz
         self.beta = compute_beta(self)
 
+        if self.is_aligned:
+            # No in-plane spin: J is along +L (beta = 0) or, when the
+            # anti-aligned spin outweighs L at fref, along -L (beta = pi).
+            # Harmonic k scales as cos^(8-2k)(beta/2) sin^(2k)(beta/2), so
+            # only h1 survives at beta = 0 and only h5 at beta = pi.
+            # reverse_flag must put the surviving one in slot 1.
+            want = int(self.beta > np.pi / 2)
+            if want != self.reverse_flag:
+                logging.warning(
+                    "Aligned-spin template (beta = %.3f) has reverse_flag=%d; "
+                    "using %d so the non-zero harmonic (h%d) is in slot 1.",
+                    self.beta, self.reverse_flag, want, 5 if want else 1)
+            self.reverse_flag = want
+
         self.comps = {}
         self.has_comps = False
 
@@ -1323,14 +1356,16 @@ class _PhenomTemplate():
         if phi12 < 0:
             phi12 += 2 * np.pi
         # prevent failure when s1z = a1 = 0
+        # (clipped: for purely aligned spins a1 == |spin1z| and roundoff can
+        # give a ratio of 1 + eps, making arccos return NaN)
         if not self.spin1z and not a1:
             tilt1 = 0.
         else:
-            tilt1 = np.arccos(self.spin1z / a1)
+            tilt1 = np.arccos(np.clip(self.spin1z / a1, -1., 1.))
         if not self.spin2z and not a2:
             tilt2 = 0.
         else:
-            tilt2 = np.arccos(self.spin2z / a2)
+            tilt2 = np.arccos(np.clip(self.spin2z / a2, -1., 1.))
         iota, spin1x, spin1y, spin1z, spin2x, spin2y, spin2z = \
             lalsim.SimInspiralTransformPrecessingNewInitialConditions(
                 thetaJN, alpha0, tilt1, tilt2, phi12, a1, a2,
@@ -1479,6 +1514,16 @@ class _PhenomTemplate():
         return self._interpolate_up(small, df)
 
     def compute_waveform_five_comps(self, df, f_final, num_comps=5, interp=True):
+        # Aligned spins: no precession, so only one harmonic is non-zero:
+        # h1 when beta = 0 (J along L) or h5 when beta = pi (J along -L,
+        # strongly anti-aligned spin). The others are identically zero in
+        # exact arithmetic and numerically roundoff noise or garbage (the
+        # J/L-frame rotations are degenerate), so only the surviving one is
+        # returned, in its own slot; callers then apply reverse_flag, which
+        # __init__ sets so that it lands in slot 1.
+        if self.is_aligned:
+            num_comps = 1
+
         if interp:
             def _func(*args, **kwargs):
                 return self.get_interpolated_harmonic_comp(*args, **kwargs)
@@ -1493,6 +1538,11 @@ class _PhenomTemplate():
         hgen1b = (hgen1a + hgen1b) / 2.
         hgen1a = tmp / 2.
         h1 = hgen1a
+
+        if self.is_aligned:
+            if self.beta > np.pi / 2:
+                return None, None, None, None, hgen1b    # h5 only
+            return h1, None, None, None, None
 
         if num_comps == 1:
             return h1, None, None, None, None
@@ -1567,9 +1617,16 @@ class _PhenomTemplate():
         match the length of the ASD, so its normalization depends on
         its own length.
         """
+        # Aligned-spin templates only have the leading harmonic, whatever
+        # num_comps the bank asks for.
+        if self.is_aligned:
+            num_comps = 1
+
         # Generate a new wf
         if not self.has_comps:
             ##Generating five harmonics, then manually assigned the rest to None after reversing!!! Hard-coded
+            # (aligned-spin templates return only h1 or only h5, the rest
+            # None; reverse_flag then puts the non-zero one in slot 1)
             h1, h2, h3, h4, h5 = self.compute_waveform_five_comps(df, self.f_final, num_comps=5)
             waveforms = [h1, h2, h3, h4, h5]
 

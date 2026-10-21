@@ -827,6 +827,21 @@ with ctx:
                     if options.total_mass_divide is not None and (template_params.mass1+template_params.mass2) >= options.total_mass_divide:
                         this_approximant = options.highmass_approximant
 
+                # Approximant may be bytes (HDF5 bank) or str (command line)
+                if isinstance(this_approximant, bytes):
+                    this_approximant = this_approximant.decode()
+                # Bank labels -> actual LALSimulation approximant
+                if this_approximant in ('IMRPhenomXP_THA', 'IMRPhenomXAS'):
+                    this_approximant = 'IMRPhenomXP'
+
+                # Aligned-spin if all in-plane spin components are zero
+                inplane_spins = (template_params.spin1x, template_params.spin1y,
+                                 template_params.spin2x, template_params.spin2y)
+                aligned_flag = all(abs(s) < 1e-8 for s in inplane_spins)
+                if aligned_flag:
+                    # Only the first harmonic is physical for aligned spin
+                    template_params.num_comps = 1
+
                 hcomps = get_tha_waveform(this_approximant,
                                           template_params,
                                           options.template_start_frequency,
@@ -838,6 +853,11 @@ with ctx:
                                         template_params['num_comps'],
                                         low_frequency_cutoff=f_lower,
                                         stilde_norm=s_norm)
+            if aligned_flag:
+                curr_matches[1] = curr_matches[0]
+                curr_matches[2] = curr_matches[0]
+                curr_matches[3] = curr_matches[0]
+                curr_matches[4] = curr_matches[0]
 
             matches.append(curr_matches)
     prog.close()

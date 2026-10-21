@@ -42,13 +42,77 @@ parser.add_argument('--colorbar-choice', choices=('effective_spin', 'mchirp',
 parser.add_argument('--chisq-choice', choices=chisq_choices,
                     default='traditional',
                     help='Which chisquared to plot. Default=traditional')
+parser.add_argument('--x-var', default='snr',
+                    choices=['snr', 'marg_lnl'],
+                    help="Which quantity to plot on the x-axis. 'snr' "
+                    "(default): the ordinary matched-filter SNR. "
+                    "'marg_lnl': the marginalized-likelihood-derived "
+                    "SNR-equivalent sqrt(2*marg_lnl) (same conversion "
+                    "ranking.marg_newsnr uses internally) -- requires "
+                    "both trigger files to have a marg_lnl column (i.e. "
+                    "the run used --marginalized-grid-file). Triggers "
+                    "where the resulting value is NaN or <= 0 (e.g. no "
+                    "marginalization grid coverage for that template) "
+                    "are dropped, since a log-scale x-axis cannot show "
+                    "them.")
 parser.add_argument('--output-file', required=True)
 args = parser.parse_args()
+
+_PRETTY_X_LABELS = {
+    'snr': 'SNR',
+    'marg_lnl': r'Marginalized-Likelihood SNR $\sqrt{2\,\ln\mathcal{L}_{\rm marg}}$',
+}
+_X_DESC = {
+    'snr': 'SNR',
+    'marg_lnl': 'Marginalized-Likelihood SNR',
+}
+
+
+def get_xvar(trigs_obj):
+    """Fetch the chosen --x-var quantity from a SingleDetTriggers
+    object, the same way regardless of whether it's the background or
+    injection triggers."""
+    if args.x_var == 'snr':
+        return trigs_obj.snr
+    else:  # 'marg_lnl'
+        # sqrt(2*marg_lnl) is the same SNR-equivalent conversion
+        # ranking.marg_newsnr uses internally.
+        #
+        # marg_lnl has no @property on SingleDetTriggers (only a fixed
+        # set of columns, e.g. snr/chisq/psd_var_val, get one), so it
+        # can't be accessed as trigs_obj.marg_lnl -- but get_column()
+        # is the same mask-aware column reader every one of those
+        # properties delegates to internally, and it works for any
+        # column name actually present in the trigger file, so call it
+        # directly instead.
+        with numpy.errstate(invalid='ignore'):
+            return numpy.sqrt(2. * trigs_obj.get_column('marg_lnl'))
 
 init_logging(args.verbose)
 # First - check the IFO being used
 with HFile(args.single_trigger_file, 'r') as stf:
     ifo = tuple(stf.keys())[0]
+
+if args.x_var == 'marg_lnl':
+    # Fail early with a clear message rather than deep inside get_xvar --
+    # both trigger files need to actually have the marg_lnl column, which
+    # only exists if the run used --marginalized-grid-file.
+    missing = []
+    with HFile(args.single_trigger_file, 'r') as stf:
+        if 'marg_lnl' not in stf[ifo]:
+            missing.append(args.single_trigger_file)
+    with HFile(args.single_injection_file, 'r') as sif:
+        if ifo in sif and 'marg_lnl' not in sif[ifo]:
+            missing.append(args.single_injection_file)
+    if missing:
+        raise ValueError(
+            "--x-var marg_lnl requires a 'marg_lnl' column in both "
+            "--single-trigger-file and --single-injection-file, but it "
+            "is missing from: {}. These files were likely produced by a "
+            "run that didn't use --marginalized-grid-file (or predate "
+            "it) -- either rerun with that option, or drop --x-var "
+            "marg_lnl to fall back to plain SNR.".format(', '.join(missing))
+        )
 
 # Add the background triggers
 with HFile(args.coinc_statistic_file, 'r') as csf:
@@ -64,7 +128,7 @@ trigs = SingleDetTriggers(
     premask=b_tids
 )
 
-bkg_snr = trigs.snr
+bkg_snr = get_xvar(trigs)
 bkg_chisq = get_chisq_from_file_choice(trigs, args.chisq_choice)
 
 # SingleDetTriggers will have discarded the ordering of the tids, and any
@@ -75,8 +139,10 @@ _, bkg_tid_idx_inverse = numpy.unique(b_tids, return_inverse=True)
 bkg_snr = bkg_snr[bkg_tid_idx_inverse]
 bkg_chisq = bkg_chisq[bkg_tid_idx_inverse]
 
-# don't plot if chisq is not calculated
-bkg_pos = bkg_chisq > 0
+# don't plot if chisq is not calculated, or (--x-var marg_lnl) if
+# there's no marginalization grid coverage for that template (NaN) or
+# the resulting SNR-equivalent isn't representable on a log axis
+bkg_pos = (bkg_chisq > 0) & numpy.isfinite(bkg_snr) & (bkg_snr > 0)
 bkg_snr = bkg_snr[bkg_pos]
 bkg_chisq = bkg_chisq[bkg_pos]
 fig = pylab.figure()
@@ -131,7 +197,7 @@ if len(inj_tid):
         ifo,
         premask=inj_tid,
     )
-    inj_snr = inj_trigs.snr
+    inj_snr = get_xvar(inj_trigs)
     inj_chisq = get_chisq_from_file_choice(inj_trigs, args.chisq_choice)
 
     # Again, the SingleDetTriggers will have discarded order etc. of tids,
@@ -147,7 +213,7 @@ else:
     inj_snr = numpy.array([])
     inj_chisq = numpy.array([])
 
-inj_pos = inj_chisq > 0
+inj_pos = (inj_chisq > 0) & numpy.isfinite(inj_snr) & (inj_snr > 0)
 # Catch not enough found injections case
 if len(coloring[args.colorbar_choice][0]) == 0:
     coloring[args.colorbar_choice] = (None, None, None)
@@ -185,11 +251,16 @@ except (TypeError, ZeroDivisionError):
         raise
 
 pylab.title('%s Coincident Triggers' % ifo, size='large')
-pylab.xlabel('SNR', size='large')
+pylab.xlabel(_PRETTY_X_LABELS[args.x_var], size='large')
 pylab.ylabel('Reduced $\chi^2$', size='large')
 try:
-    pylab.xlim(min(inj_snr.min(), bkg_snr.min()) * 0.99,
-               max(inj_snr.max(), bkg_snr.max()) * 1.4)
+    # Note: inj_snr/inj_chisq are filtered by inj_pos here (unlike
+    # bkg_snr/bkg_chisq, which were already filtered down in place
+    # above) -- necessary so that, with --x-var marg_lnl, any NaN /
+    # non-positive entries dropped from the plot don't also corrupt
+    # these axis bounds.
+    pylab.xlim(min(inj_snr[inj_pos].min(), bkg_snr.min()) * 0.99,
+               max(inj_snr[inj_pos].max(), bkg_snr.max()) * 1.4)
     pylab.ylim(min(bkg_chisq.min(), inj_chisq[inj_pos].min()) * 0.7,
                max(bkg_chisq.max(), inj_chisq.max()) * 1.4)
 except ValueError:
@@ -199,13 +270,15 @@ pylab.legend(loc='lower right', prop={'size': 10})
 pylab.grid(which='major', ls='solid', alpha=0.7, linewidth=.5)
 pylab.grid(which='minor', ls='solid', alpha=0.7, linewidth=.1)
 
-title = '%s %s chisq vs SNR. %s background with injections %s' \
-        % (ifo.upper(), args.chisq_choice, ''.join(ifos).upper(),
+title = '%s %s chisq vs %s. %s background with injections %s' \
+        % (ifo.upper(), args.chisq_choice, _X_DESC[args.x_var],
+           ''.join(ifos).upper(),
            'behind' if args.background_front else 'ontop')
-caption = """Distribution of SNR and %s chi-squared veto for single detector
+caption = """Distribution of %s and %s chi-squared veto for single detector
 triggers. Black points are %s background triggers. Triangles are injection
 triggers colored by %s of the injection. Dashed lines show contours of
-constant NewSNR.""" % (args.chisq_choice, ''.join(ifos).upper(),
+constant NewSNR.""" % (_X_DESC[args.x_var], args.chisq_choice,
+                       ''.join(ifos).upper(),
                        coloring[args.colorbar_choice][1])
 pycbc.results.save_fig_with_metadata(fig,
                                      args.output_file,

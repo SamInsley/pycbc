@@ -199,7 +199,7 @@ parser.add_argument("--marg-exclude-hf-cutoff", type=float, default=300.,
                          "marg_lnl computation. Only used if "
                          "--marginalized-grid-file is set. Default: 300.")
 parser.add_argument("--marg-exclude-hf-fraction-threshold", type=float,
-                    default=0.4, metavar='FRACTION',
+                    default=2., metavar='FRACTION',
                     help="If a harmonic's ACTUAL orthonormal matched-"
                          "filter template (not the raw harmonic) has "
                          "more than this fraction of its PSD-weighted "
