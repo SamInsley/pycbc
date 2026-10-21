@@ -11,7 +11,7 @@ name: 3G live image
 on:
   workflow_dispatch:
   push:
-    branches: [3G-main-branch]
+    branches: [Marginalize]
     paths:
       - 'pycbc/**'
       - 'bin/**'
