@@ -31,7 +31,7 @@ https://ldas-jobs.ligo.caltech.edu/~cbc/docs/pycbc/NOTYETCREATED.html
 import os
 import logging
 
-from pycbc.workflow.core import FileList, make_analysis_dir
+from pycbc.workflow.core import FileList
 from pycbc.workflow.jobsetup import (PycbcSplitBankExecutable,
         PycbcSplitBankXmlExecutable, PycbcSplitInspinjExecutable,
         PycbcHDFSplitInjExecutable)
@@ -99,7 +99,6 @@ def setup_splittable_workflow(workflow, input_tables, out_dir=None, tags=None):
     if tags is None:
         tags = []
     logger.info("Entering split output files module.")
-    make_analysis_dir(out_dir)
     # Parse for options in .ini file
     splitMethod = workflow.cp.get_opt_tags("workflow-splittable",
                                            "splittable-method", tags)

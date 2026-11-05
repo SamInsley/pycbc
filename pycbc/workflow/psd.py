@@ -42,7 +42,6 @@ def chunks(l, n):
     yield l[n*newn-newn:]
 
 def merge_psds(workflow, files, ifo, out_dir, tags=None):
-    make_analysis_dir(out_dir)
     tags = [] if not tags else tags
     node = MergePSDFiles(workflow.cp, 'merge_psds',
                          ifos=ifo, out_dir=out_dir,
@@ -83,7 +82,6 @@ def setup_psd_calculate(workflow, frame_files, ifo, segments,
 
 def make_psd_file(workflow, frame_files, segment_file, segment_name, out_dir,
                   tags=None):
-    make_analysis_dir(out_dir)
     tags = [] if not tags else tags
     exe = CalcPSDExecutable(workflow.cp, 'calculate_psd',
                              ifos=segment_file.ifo, out_dir=out_dir,
@@ -104,7 +102,6 @@ class AvgPSDExecutable(Executable):
 
 def make_average_psd(workflow, psd_files, out_dir, tags=None,
                      output_fmt='.txt'):
-    make_analysis_dir(out_dir)
     tags = [] if tags is None else tags
     node = AvgPSDExecutable(workflow.cp, 'average_psd', ifos=workflow.ifos,
                             out_dir=out_dir, tags=tags).create_node()

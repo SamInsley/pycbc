@@ -620,10 +620,6 @@ class Executable(pegasus_workflow.Executable):
         if not os.path.isabs(self.out_dir):
             self.out_dir = os.path.join(os.getcwd(), self.out_dir)
 
-        # Make output directory if not there
-        if not os.path.isdir(self.out_dir):
-            make_analysis_dir(self.out_dir)
-
     def _set_pegasus_profile_options(self):
         """Set the pegasus-profile settings for this Executable.
 
@@ -782,6 +778,7 @@ class Workflow(pegasus_workflow.Workflow):
         # Must execute in output directory.
         curr_dir = os.getcwd()
         out_dir = node.executable.out_dir
+        make_analysis_dir(out_dir)
         os.chdir(out_dir)
 
         # Make call
