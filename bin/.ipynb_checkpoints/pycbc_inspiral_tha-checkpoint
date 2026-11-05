@@ -533,6 +533,12 @@ def template_triggers(t_num):
 
         out_vals = out_vals_ref.copy()
 
+        # Template's J-L opening angle (bank.compute_beta), set on
+        # bank.curr_tmp by bank.get() above; one value per trigger so it
+        # survives the marg_lnl threshold and clustering below
+        out_vals['beta'] = numpy.full(len(snrv_full), bank.curr_tmp.beta,
+                                      dtype=float32)
+
         # --- marg_lnl computed and thresholded FIRST, before the much
         # more expensive bank_chisq/chisq/sg_chisq calls below, so that
         # triggers cut by --marg-lnl-threshold never have chisq computed
@@ -786,7 +792,9 @@ def template_triggers(t_num):
         idx += stilde.cumulative_index
         out_vals['time_index'] = idx
 
-        out_vals['sigmasq'] = numpy.zeros(len(snrv_full), dtype=float32) + sigmasq
+        h1 = (bank.curr_tmp.h1 * DYN_RANGE_FAC).astype(complex64)
+        out_vals['sigmasq'] = numpy.zeros(len(snrv_full), dtype=float32) + \
+            pycbc.filter.sigmasq(h1, stilde.psd, low_frequency_cutoff=flow)
         if opt.psdvar_short_segment is not None:
             out_vals['psd_var_val'] = \
                         pycbc.psd.find_trigger_value(psd_var,
@@ -862,6 +870,9 @@ with ctx:
         # applicable" case, just spelled as -1 since this column is an
         # int).
         'marg_ta_idx'    : numpy.int32,
+        # Template's J-L opening angle (bank.compute_beta); 0 or pi for
+        # aligned-spin templates
+        'beta'           : float32,
                 }
     out_types.update(SingleDetSGChisq.returns)
     out_vals_ref = {key: None for key in out_types}

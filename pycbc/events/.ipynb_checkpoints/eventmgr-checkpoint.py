@@ -499,6 +499,10 @@ class EventManager(object):
                 f['marg_snr'] = self.events['marg_snr']
                 f['marg_phase'] = self.events['marg_phase']
                 f['marg_ta_idx'] = self.events['marg_ta_idx']
+            if 'beta' in self.events.dtype.names:
+                # Template's opening angle between J and L at f_ref
+                # (bank.compute_beta): 0 or pi for aligned-spin templates
+                f['beta'] = self.events['beta']
             if 'cont_chisq' in self.events.dtype.names:
                 f['cont_chisq'] = self.events['cont_chisq']
                 # FIXME: Can we get this value from the autochisq instance?

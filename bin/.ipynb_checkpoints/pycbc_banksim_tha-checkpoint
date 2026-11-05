@@ -18,6 +18,7 @@
 """Calculate the fitting factors of simulated signals with a template bank."""
 
 import logging
+import multiprocessing
 from tqdm import tqdm
 from numpy import complex64, complex128, array
 from argparse import ArgumentParser
@@ -41,12 +42,64 @@ from math import ceil, log, sqrt
 import pycbc.psd, pycbc.scheme, pycbc.fft, pycbc.strain, pycbc.version
 from pycbc.detector import overhead_antenna_pattern as generate_fplus_fcross
 from pycbc.waveform import TemplateBank
+import pycbc.filter.tha_marginalize as tha_marginalize
 
 ## The THA 5-comp match function is not so trivial
 
+class GridFiles:
+    """Read one template's grid entry at a time (the combined grid file is
+    too big to load whole with tha_marginalize.load_raw_grid_file).
+    get(template_hash) returns the same dict load_raw_grid_file would."""
+    def __init__(self, paths):
+        import h5py
+        self.files, self.index = [], {}
+        for path in paths:
+            f = h5py.File(path, 'r')
+            self.files.append(f)
+            for row, h in enumerate(f['template_hash'][:]):
+                self.index[int(h)] = (f, row)
+        a = self.files[0].attrs
+        self.attrs = dict(a)
+        self.theta_grid = np.asarray(a['theta_grid'])
+        self.alpha_grid = np.asarray(a['alpha_grid'])
+
+    def get(self, template_hash, df=None, kmin=None, kmax=None):
+        """df/kmin/kmax: override the grid file's frequency binning with this
+        run's (see --marg-grid-any-df). A and B relate waveforms to waveforms,
+        so they do not depend on the frequency sampling; only the binning
+        used to evaluate inner products does."""
+        if int(template_hash) not in self.index:
+            return None
+        f, row = self.index[int(template_hash)]
+        return dict(A=f['A'][row], B=f['B'][row],
+                    dpsi=tha_marginalize._dpsi_grid(self.theta_grid, self.alpha_grid,
+                                                    float(f['beta'][row])),
+                    weights_ta=np.asarray(self.attrs['weights_ta']),
+                    df=float(self.attrs['df']) if df is None else df,
+                    kmin=int(self.attrs['kmin']) if kmin is None else kmin,
+                    kmax=int(self.attrs['kmax']) if kmax is None else kmax,
+                    theta_grid=self.theta_grid, alpha_grid=self.alpha_grid)
+
+class RunningBest:
+    """Stand-in for the per-signal list of match rows. The output only needs,
+    for each column, the max over templates and the index of the first
+    template reaching it, so keep just those instead of every row (the full
+    list grows by one row per template per signal and was exhausting job
+    memory). Results are identical to max()/argmax() over the full list."""
+    def __init__(self, ncol):
+        self.vals = np.full(ncol, -np.inf)
+        self.idx = np.zeros(ncol, dtype=int)
+        self.n = 0
+    def append(self, row):
+        row = np.asarray(row, dtype=float)
+        better = row > self.vals          # strict: keep the first maximum
+        self.vals[better] = row[better]
+        self.idx[better] = self.n
+        self.n += 1
+
 _snr = [None, None, None, None, None]
-def match_tha(hcomps, stilde, num_comps, low_frequency_cutoff=None,
-          high_frequency_cutoff=None, stilde_norm=None):
+def match_tha(grid, raws, psd_arr, hcomps, stilde, num_comps, low_frequency_cutoff=None,
+          high_frequency_cutoff=None, stilde_norm=None, n_psi=16, window=10):
     N = (len(stilde)-1) * 2
     if _snr[0] is None or _snr[0].dtype != stilde.dtype or len(_snr[0]) != N:
         for i in range(5):
@@ -54,6 +107,7 @@ def match_tha(hcomps, stilde, num_comps, low_frequency_cutoff=None,
 
     snr = [None, None, None, None, None]
     snr_norm = [None, None, None, None, None]
+    zc = []                    # complex harmonic SNRs, kept for the grid
     ret_snrs = []
     ret_ids = []
     for i in range(5):
@@ -62,6 +116,7 @@ def match_tha(hcomps, stilde, num_comps, low_frequency_cutoff=None,
                                                high_frequency_cutoff,
                                                1., out=_snr[i])
         snr[i] *= snr_norm[i] / sqrt(stilde_norm)
+        zc.append(snr[i].numpy().copy())
         snr[i] = abs(snr[i])
 
         # This bit is going to be slow ...
@@ -79,7 +134,37 @@ def match_tha(hcomps, stilde, num_comps, low_frequency_cutoff=None,
         else:
             ret_snrs.append(ret_snrs[i-1])
 
-    return ret_snrs, ret_ids
+    if grid is None:
+        return ret_snrs, ret_ids
+
+    # Grid SNR (marg_snr, as pycbc_inspiral_tha computes it via
+    # marginalize_for_psd) using the first k harmonics, evaluated in a small
+    # window around the k-harmonic peak. The grid matrices depend only on the
+    # template and PSD, so they are built once per template and cached in
+    # `grid` (a fresh dict per template) instead of on every call.
+    if '_M' not in grid:
+        Ep, Ec, hpp, hcc, hpc = tha_marginalize.derive_ep_ec_hh(
+            raws, grid['A'], grid['B'], psd_arr, grid['df'], grid['kmin'], grid['kmax'])
+        grid['_M'], grid['_hh'], grid['_lnw'], _ = tha_marginalize.fold_psi(
+            Ep, Ec, hpp, hcc, hpc, grid['dpsi'], grid['weights_ta'], n_psi)
+    M, hh, lnw = grid['_M'], grid['_hh'], grid['_lnw']
+
+    zc = np.nan_to_num(np.array(zc))
+    grid_snrs = []
+    for k in range(1, 6):
+        t0 = ret_ids[k-1]
+        t = np.arange(t0 - window, t0 + window + 1) % N
+        z = zc[:, t].copy()
+        z[k:] = 0.                      # only the first k harmonics filtered
+        _, _, best_dh, best_hh = tha_marginalize.marginalize_segment(
+            M, hh, lnw, z, method='max', return_argmax=True)
+        grid_snrs.append(float(np.max(np.abs(best_dh) / np.sqrt(best_hh))))
+    num_comps_gsnr = grid_snrs[num_comps-1]
+    grid_snrs.append(num_comps_gsnr)
+    for i in [2,3,4]:
+        grid_snrs.append(num_comps_gsnr if i > num_comps else grid_snrs[i-1])
+
+    return ret_snrs + grid_snrs, ret_ids
 
 
 ## Remove the need for these functions ########################################
@@ -151,15 +236,65 @@ def make_padded_frequency_series(vec, filter_N=None, delta_f=None):
     return FrequencySeries(vectilde * DYN_RANGE_FAC, delta_f=delta_f,
                            dtype=complex128)
 
+def get_xp_fd_waveform_lal(wf_params, delta_f, f_lower, f_max,
+                           prec_version, final_spin_mod):
+    """IMRPhenomXP h+, hx straight from LALSimulation with explicit
+    PrecVersion / FinalSpinMod, i.e. the same settings the templates use
+    (PhenomXPTemplate.flag = True -> 320 / 2). Same retry-at-finer-df
+    strategy as the templates if SimInspiralFD-style GSL errors occur."""
+    LALparams = lal.CreateDict()
+    lalsim.SimInspiralWaveformParamsInsertPhenomXPrecVersion(LALparams, prec_version)
+    lalsim.SimInspiralWaveformParamsInsertPhenomXPFinalSpinMod(LALparams, final_spin_mod)
+    f_ref = getattr(wf_params, 'f_ref', 0.) or f_lower
+    args = (wf_params.mass1 * lal.MSUN_SI, wf_params.mass2 * lal.MSUN_SI,
+            wf_params.spin1x, wf_params.spin1y, wf_params.spin1z,
+            wf_params.spin2x, wf_params.spin2y, wf_params.spin2z,
+            wf_params.distance * 1e6 * lal.PC_SI, wf_params.inclination,
+            wf_params.coa_phase, getattr(wf_params, 'long_asc_nodes', 0.) or 0.,
+            0., 0.)
+    hp = None
+    for denom in (1, 2, 4, 8, 16):
+        try:
+            hp, hc = lalsim.SimInspiralChooseFDWaveform(
+                *args, delta_f / denom, f_lower, f_max, f_ref, LALparams,
+                lalsim.IMRPhenomXP)
+            break
+        except RuntimeError:
+            continue
+    if hp is None:
+        # Same last resort as the templates (gen_hp_hc): the Spin-Taylor
+        # Euler angles (PrecVersion 320) can hit a GSL interpolation error for
+        # some parameters at every df. Fall back to LAL's default settings
+        # for this injection rather than failing the whole job.
+        logging.warning(
+            "Injection m1=%.3f m2=%.3f s1=(%.3f,%.3f,%.3f) s2=(%.3f,%.3f,%.3f): "
+            "PrecVersion %d failed at all df; using LAL default PhenomXP settings",
+            wf_params.mass1, wf_params.mass2, wf_params.spin1x, wf_params.spin1y,
+            wf_params.spin1z, wf_params.spin2x, wf_params.spin2y, wf_params.spin2z,
+            prec_version)
+        denom = 1
+        hp, hc = lalsim.SimInspiralChooseFDWaveform(
+            *args, delta_f, f_lower, f_max, f_ref, lal.CreateDict(),
+            lalsim.IMRPhenomXP)
+    hp = FrequencySeries(hp.data.data[::denom].copy(), delta_f=delta_f, epoch=hp.epoch)
+    hc = FrequencySeries(hc.data.data[::denom].copy(), delta_f=delta_f, epoch=hc.epoch)
+    return hp, hc
+
+
 def get_waveform(approximant, phase_order, amplitude_order, spin_order,
                  wf_params, start_frequency, sample_rate, length,
-                 filter_rate):
+                 filter_rate, xp_lal_settings=None):
 
     if type(approximant) is not str:
         approximant = approximant.decode('utf-8')
 
     delta_f = filter_rate / length
-    if approximant in fd_approximants():
+    if approximant == 'IMRPhenomXP' and xp_lal_settings is not None:
+        hp, hc = get_xp_fd_waveform_lal(wf_params, delta_f, start_frequency,
+                                        sample_rate / 2., *xp_lal_settings)
+        hvec = generate_detector_strain(wf_params, hp, hc)
+
+    elif approximant in fd_approximants():
         hp, hc = get_fd_waveform(wf_params, approximant=approximant,
                                  phase_order=phase_order, delta_f=delta_f,
                                  spin_order=spin_order,
@@ -226,7 +361,9 @@ def _dpsi(theta_jn, phi_jl, beta):
     p_j /= np.linalg.norm(p_j)
     p_l = np.cross(n, l)
     p_l /= np.linalg.norm(p_l)
-    cosine = np.inner(p_j, p_l)
+    # Clip: for aligned spins (beta = 0) p_l == p_j and roundoff can push
+    # the inner product just above 1, which would make arccos return NaN.
+    cosine = np.clip(np.inner(p_j, p_l), -1., 1.)
     sine = np.inner(n, np.cross(p_j, p_l))
     dpsi = np.pi / 2 + np.sign(sine) * np.arccos(cosine)
     return dpsi
@@ -257,10 +394,15 @@ def _dphi(theta_jn, phi_jl, beta):
             np.cos(beta)
         ]
     )
-    cosi = [np.inner(nn, ll) for nn, ll in zip(n, l)]
+    cosi = np.clip([np.inner(nn, ll) for nn, ll in zip(n, l)], -1., 1.)
     inc = np.arccos(cosi)
     sign = np.sign(np.cos(theta_jn) - (np.cos(beta) * np.cos(inc)))
-    cos_d = np.cos(phi_jl) * np.sin(theta_jn) / np.sin(inc)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cos_d = np.cos(phi_jl) * np.sin(theta_jn) / np.sin(inc)
+    # L along the line of sight (sin(inc) = 0, e.g. aligned spins viewed
+    # face-on): the J- and L-frame phases coincide, so no rotation. Without
+    # this the 0/0 above gives NaN and the whole harmonic becomes NaN.
+    cos_d[~np.isfinite(cos_d)] = 1.
     inds = np.logical_or(cos_d < -1, cos_d > 1)
     cos_d[inds] = np.sign(cos_d[inds]) * 1.
     dphi = -1. * sign * np.arccos(cos_d)
@@ -297,7 +439,9 @@ def compute_beta(tmplt):
     jz = lmag + s1z + s2z
 
     jnorm = (jx * jx + jy * jy + jz * jz) ** (1. / 2.)
-    jhatz = jz / jnorm
+    # Clip: with no in-plane spin jnorm == |jz| up to roundoff, and a ratio
+    # of 1 + eps would make arccos return NaN instead of beta = 0.
+    jhatz = np.clip(jz / jnorm, -1., 1.)
 
     return np.arccos(jhatz)
 
@@ -353,44 +497,76 @@ class _FDTemplate():
 
         self.comps = {}
 
-    def gen_harmonics_comp(self, thetaJN, alpha0, phi0, psi, df, f_final):
-        # calculate cartesian spins for waveform generator
-        a1 = np.sqrt(
-            np.sum(np.square([self.spin1x, self.spin1y, self.spin1z]))
-        )
-        a2 = np.sqrt(
-            np.sum(np.square([self.spin2x, self.spin2y, self.spin2z]))
-        )
-        phi1 = np.fmod(
-            2 * np.pi + np.arctan2(self.spin1y, self.spin1x),
-            2 * np.pi
-        )
-        phi2 = np.fmod(
-            2 * np.pi + np.arctan2(self.spin2y, self.spin2x),
-            2 * np.pi
-        )
+    def gen_hp_hc(self, thetaJN, alpha0, phi0, df, f_final):
+        """h+, hx for the given J-frame orientation. Same fixes as bank.py:
+        tilt guard/clip, iota clamp, and retry at a finer df (the caller
+        decimates back) if SimInspiralFD fails, with a last-resort fallback
+        that drops the Spin-Taylor Euler-angle flags."""
+        a1 = np.sqrt(np.sum(np.square([self.spin1x, self.spin1y, self.spin1z])))
+        a2 = np.sqrt(np.sum(np.square([self.spin2x, self.spin2y, self.spin2z])))
+        phi1 = np.fmod(2 * np.pi + np.arctan2(self.spin1y, self.spin1x), 2 * np.pi)
+        phi2 = np.fmod(2 * np.pi + np.arctan2(self.spin2y, self.spin2x), 2 * np.pi)
         phi12 = phi2 - phi1
         if phi12 < 0:
             phi12 += 2 * np.pi
-        tilt1 = np.arccos(self.spin1z / a1)
-        tilt2 = np.arccos(self.spin2z / a2)
+        # prevent failure when s1z = a1 = 0; clip because for purely aligned
+        # spins a1 == |spin1z| and roundoff can give a ratio of 1 + eps
+        if not self.spin1z and not a1:
+            tilt1 = 0.
+        else:
+            tilt1 = np.arccos(np.clip(self.spin1z / a1, -1., 1.))
+        if not self.spin2z and not a2:
+            tilt2 = 0.
+        else:
+            tilt2 = np.arccos(np.clip(self.spin2z / a2, -1., 1.))
         iota, spin1x, spin1y, spin1z, spin2x, spin2y, spin2z = \
             lalsim.SimInspiralTransformPrecessingNewInitialConditions(
                 thetaJN, alpha0, tilt1, tilt2, phi12, a1, a2,
                 self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, self.fref, phi0
             )
-        # generate hp, hc for given orientation with lalsimulation
+        if iota < 1e-2:
+            iota = 1e-2
+
         LALparams = lal.CreateDict()
+        # The flags below change the euler angles to Spin-Taylor
         if self.flag == True:
-            lalsim.SimInspiralWaveformParamsInsertPhenomXPrecVersion(LALparams, 300)
+            lalsim.SimInspiralWaveformParamsInsertPhenomXPrecVersion(LALparams, 320)
             lalsim.SimInspiralWaveformParamsInsertPhenomXPFinalSpinMod(LALparams, 2)
 
-        hp, hc = lalsim.SimInspiralFD(
-            self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x, spin1y,
-            spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI, iota, phi0,
-            0, 0, 0, df, self.flow, f_final, self.fref, LALparams,
-            lalsim.GetApproximantFromString(self.approximant)
-        )
+        # A minority of (template, orientation) combinations hit an internal
+        # GSL interpolation domain error in SimInspiralFD at the requested df;
+        # generating at a finer df avoids it. Retry at df/2 ... df/16 before
+        # giving up; the caller decimates back to df using the returned denom.
+        hp = hc = None
+        denom = 1
+        for denom in (1, 2, 4, 8, 16):
+            try:
+                hp, hc = lalsim.SimInspiralFD(
+                    self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x,
+                    spin1y, spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI,
+                    iota, phi0, 0, 0, 0, df/denom, self.flow, f_final,
+                    self.fref, LALparams,
+                    lalsim.GetApproximantFromString(self.approximant)
+                )
+                break
+            except RuntimeError:
+                continue
+
+        if hp is None:
+            # Nothing at any df worked: fall back once more at the original
+            # df without the flag-based Euler-angle overrides (standard MSA
+            # angles). Let any failure here propagate normally.
+            denom = 1
+            hp, hc = lalsim.SimInspiralFD(
+                self.mass1*lal.MSUN_SI, self.mass2*lal.MSUN_SI, spin1x,
+                spin1y, spin1z, spin2x, spin2y, spin2z, 1.e6*lal.PC_SI,
+                iota, phi0, 0, 0, 0, df, self.flow, f_final, self.fref,
+                lal.CreateDict(), lalsim.GetApproximantFromString(self.approximant)
+            )
+        return hp, hc, denom
+
+    def gen_harmonics_comp(self, thetaJN, alpha0, phi0, psi, df, f_final):
+        hp, hc, denom = self.gen_hp_hc(thetaJN, alpha0, phi0, df, f_final)
         # 1908.05707 defines psi in J-aligned frame. Need to rotate to
         # L-aligned frame and multiply by w+, wx
         dpsi = _dpsi(thetaJN, alpha0, self.beta)
@@ -400,13 +576,17 @@ class _FDTemplate():
         # 1908.05707 defines phi in J-aligned frame. Need to rotate to
         # L-aligned frame
         h *= np.exp(2j * _dphi(thetaJN, alpha0, self.beta))
+        if denom > 1:
+            # generated at df/denom: keep every denom-th sample to get back to
+            # df (same decimation as bank.py's _decimate_to_target_df)
+            h = h[::denom].copy()
         # create LAL frequency array and return precessing harmonic
         new = lal.CreateCOMPLEX16FrequencySeries(
             "", lal.LIGOTimeGPS(hp.epoch), 0, df, lal.SecondUnit, len(h)
         )
         new.data.data[:] = h[:]
         return new
-    
+
     def compute_waveform_five_comps(self, df, f_final):
         # calculate 5 harmonic decomposition as defined in 1908.05707
         hgen1a = self.gen_harmonics_comp(
@@ -474,6 +654,9 @@ class _FDTemplate():
         # Error check
         if waveforms[0].data.length > len(ASD):
             raise ValueError("waveform has length greater than ASD; cannot whiten")
+
+        # Raw (unwhitened) harmonics, in reverse_flag order, for the grid
+        self.raws = [np.nan_to_num(w.data.data.copy()) for w in waveforms]
 
         # Process waveforms: whiten, normalize, and orthogonalize
         arr_views = [w.data.data for w in waveforms]
@@ -567,7 +750,35 @@ def get_tha_waveform(approximant, wf_params, start_frequency, sample_rate,
 
     #curr_tmp.test_five_comps_orthogonality(delta_f, psd)
 
-    return curr_tmp.new_get_whitened_normalized_comps(delta_f, psd, reverse_flag)
+    hcomps = curr_tmp.new_get_whitened_normalized_comps(delta_f, psd, reverse_flag)
+    return hcomps, curr_tmp.raws
+
+
+def _template_worker(args):
+    """Generate one template in a separate (forked) worker process.
+
+    LALSimulation can leak memory when PhenomXP PrecVersion 320 fails partway
+    (the GSL interpolation errors that trigger the df/denom retries), so a
+    long job slowly grows. Generating templates in a worker that is replaced
+    every --waveform-worker-recycle templates returns that memory to the OS.
+    The worker inherits template_table and psd from the parent via fork.
+    Results are sent back as plain numpy arrays."""
+    global template_params
+    index, approx, f_start, t_sr, f_n, f_sr = args
+    template_params = template_table[index]     # get_tha_waveform reads this global
+    hcomps, raws = get_tha_waveform(approx, template_params, f_start, t_sr,
+                                    f_n, f_sr, psd)
+    out = []
+    for h in hcomps:
+        ep = h.epoch
+        out.append((h.numpy().copy(), float(h.delta_f),
+                    float(ep) if ep not in ('', None) else ''))
+    return out, raws
+
+
+def _rebuild_hcomps(packed):
+    return [FrequencySeries(arr, delta_f=df, epoch=ep, dtype=np.complex128)
+            for arr, df, ep in packed]
     
 
 
@@ -620,9 +831,50 @@ parser.add_argument("--signal-start-frequency", type=float,
                     help="Starting frequency for signals [Hz]")
 parser.add_argument("--signal-sample-rate", type=float,
                     help="Sample rate for signals [Hz]")
+parser.add_argument("--signal-phenomxp-prec-version", type=int, default=None,
+                    help="If given (with --signal-approximant IMRPhenomXP), "
+                         "generate injections directly with LALSimulation "
+                         "using this PhenomXPrecVersion (e.g. 320, matching "
+                         "the templates). Default: LAL's default settings.")
+parser.add_argument("--signal-phenomxp-final-spin-mod", type=int, default=2,
+                    help="PhenomXPFinalSpinMod for injections when "
+                         "--signal-phenomxp-prec-version is given. Default 2 "
+                         "(matching the templates).")
 parser.add_argument("--use-sky-location", action='store_true',
                     help="Inject into a theoretical detector at the celestial "
                          "North pole of a non-rotating Earth rather than overhead")
+parser.add_argument("--marginalized-grid-file", type=str, nargs='+', default=None,
+                  help="Path(s) to one or more auxiliary HDF5 files (as "
+                       "written by pycbc_make_tha_marginalization_grid) "
+                       "with per-template, PSD-independent 5-harmonic "
+                       "marginalization-grid data, keyed by template_hash "
+                       "(pass multiple files if the bank was processed in "
+                       "several split jobs). If given, a 'marg_lnl' column "
+                       "is added to the output triggers -- see "
+                       "--marg-lnl-method for how it's computed -- along "
+                       "with the (theta_jn, alpha0, psi) grid point that "
+                       "produced it ('marg_theta'/'marg_alpha'/'marg_psi') "
+                       "and the SNR/phase of the data projected onto that "
+                       "point ('marg_snr'/'marg_phase'). Templates not "
+                       "present in any of the given files get NaN in all "
+                       "six columns. See THA_MARG_INFO.md.")
+
+parser.add_argument("--waveform-worker-recycle", type=int, default=200,
+                    help="Generate templates in a worker process that is "
+                         "restarted every N templates, so memory leaked by "
+                         "LALSimulation on failed waveform calls is returned "
+                         "(prevents memory growing over a long job). "
+                         "0 = generate in the main process (old behaviour). "
+                         "Default 200.")
+parser.add_argument("--marg-grid-any-df", action='store_true', default=False,
+                    help="Allow a grid file built at a different delta_f "
+                         "(e.g. the search's 1/512 Hz) to be used with this "
+                         "run's --filter-signal-length: the grid's A/B are "
+                         "reused and evaluated on this run's frequency "
+                         "binning. sample_rate and low-frequency cutoff must "
+                         "still match.")
+parser.add_argument("--marg-n-psi", type=int, default=16,
+                    help="psi points folded into the grid (match the search).")
 
 #Filtering Settings
 parser.add_argument('--filter-low-frequency-cutoff', metavar='FREQ', type=float,
@@ -632,6 +884,7 @@ parser.add_argument("--filter-sample-rate", type=float, required=True,
 parser.add_argument("--filter-signal-length", type=int, required=True,
                     help="Length of signal for filtering, shoud be longer "
                          "than all waveforms and include some padding")
+ 
 
 # add PSD options
 pycbc.psd.insert_psd_option_group(parser, output=False)
@@ -664,6 +917,13 @@ options = parser.parse_args()
 pycbc.init_logging(options.verbose)
 
 pycbc.psd.verify_psd_options(options, parser)
+
+xp_lal_settings = None
+if options.signal_phenomxp_prec_version is not None:
+    xp_lal_settings = (options.signal_phenomxp_prec_version,
+                       options.signal_phenomxp_final_spin_mod)
+    logging.info("Injections: IMRPhenomXP via LALSimulation with PrecVersion %d, "
+                 "FinalSpinMod %d", *xp_lal_settings)
 
 if options.psd_estimation:
     pycbc.strain.verify_strain_options(options, parser)
@@ -739,6 +999,25 @@ psd = pycbc.psd.from_cli(options, filter_n, filter_delta_f,
                          dyn_range_factor=pycbc.DYN_RANGE_FAC,
                          precision='double')
   
+grid_files = None
+if options.marginalized_grid_file:
+    grid_files = GridFiles(options.marginalized_grid_file)
+    a = grid_files.attrs
+    df_mismatch = abs(a['df'] - filter_delta_f) > 1e-12
+    if df_mismatch and options.marg_grid_any_df:
+        logging.info("Grid file df %s != run df %s: reusing A/B at the run's "
+                     "binning (--marg-grid-any-df)", a['df'], filter_delta_f)
+        df_mismatch = False
+    if (df_mismatch or
+            abs(a['sample_rate'] - options.filter_sample_rate) > 1e-6 or
+            abs(a['low_frequency_cutoff'] - options.filter_low_frequency_cutoff) > 1e-6):
+        raise ValueError("Grid file built with df/sample_rate/flow {}/{}/{}, this run "
+                         "uses {}/{}/{}".format(a['df'], a['sample_rate'],
+                         a['low_frequency_cutoff'], filter_delta_f,
+                         options.filter_sample_rate, options.filter_low_frequency_cutoff))
+psd_arr = np.asarray(psd.numpy(), dtype=np.float64)
+N_MATCH = 18 if grid_files is not None else 9
+
 with ctx: 
     pycbc.fft.from_cli(options)
 
@@ -761,11 +1040,12 @@ with ctx:
                               signal_params,
                               options.signal_start_frequency,
                               signal_sample_rate,
-                              filter_N, options.filter_sample_rate)
+                              filter_N, options.filter_sample_rate,
+                              xp_lal_settings=xp_lal_settings)
         s_norm = sigmasq(stilde, psd=psd,
                          low_frequency_cutoff=options.filter_low_frequency_cutoff)
         stilde /= psd**0.5
-        signals.append((stilde, s_norm, [], signal_params))
+        signals.append((stilde, s_norm, RunningBest(N_MATCH), signal_params))
         sig_m1.append(signal_params.mass1)
         sig_m2.append(signal_params.mass2)
     prog.close()
@@ -783,6 +1063,11 @@ with ctx:
     template_mchirp, _ = mass1_mass2_to_mchirp_eta(template_m1, template_m2)
 
     logging.info("Calculating Overlaps")
+
+    wf_pool = None
+    if options.waveform_worker_recycle > 0:
+        wf_pool = multiprocessing.get_context('fork').Pool(
+            1, maxtasksperchild=options.waveform_worker_recycle)
 
     flow_warned = False
     prog = tqdm(total=len(template_table), disable=(not options.verbose))
@@ -811,7 +1096,7 @@ with ctx:
             check_logic |= outside_mchirp_window(template_mchirp[index],
                                                  sig_mchirp[sidx])
             if check_logic:
-                matches.append([0.,0.,0.,0.,0.,0.,0.,0.,0.])
+                matches.append([0.] * N_MATCH)
                 continue
 
             # Generate htilde if we haven't already done so
@@ -842,52 +1127,78 @@ with ctx:
                     # Only the first harmonic is physical for aligned spin
                     template_params.num_comps = 1
 
-                hcomps = get_tha_waveform(this_approximant,
-                                          template_params,
-                                          options.template_start_frequency,
-                                          template_sample_rate,
-                                          filter_N, options.filter_sample_rate,
-                                          psd)
+                if grid_files is None:
+                    grid = None
+                elif options.marg_grid_any_df:
+                    grid = grid_files.get(
+                        template_params.template_hash, df=filter_delta_f,
+                        kmin=int(options.filter_low_frequency_cutoff / filter_delta_f),
+                        kmax=int(options.filter_sample_rate / 2. / filter_delta_f))
+                else:
+                    grid = grid_files.get(template_params.template_hash)
+                if wf_pool is None:
+                    hcomps, raws = get_tha_waveform(this_approximant,
+                                              template_params,
+                                              options.template_start_frequency,
+                                              template_sample_rate,
+                                              filter_N, options.filter_sample_rate,
+                                              psd)
+                else:
+                    packed, raws = wf_pool.apply(_template_worker, ((
+                        index, this_approximant, options.template_start_frequency,
+                        template_sample_rate, filter_N,
+                        options.filter_sample_rate),))
+                    hcomps = _rebuild_hcomps(packed)
 
-            curr_matches, _ = match_tha(hcomps, stilde,
+            # Aligned-spin templates have only harmonic 1 (the grid file's A/B
+            # are zero for harmonics 2-5). This script generates all five
+            # harmonics for them, and 2-5 are numerical leftovers; their
+            # filters are not consistent with the grid's model, which made
+            # flat grid k>=3 exceed 1. For the GRID only, treat raws 2-5 as
+            # zero so they drop out (the grid analogue of the existing
+            # aligned_flag override of the quadrature columns below).
+            raws_grid = raws
+            if aligned_flag and grid is not None:
+                raws_grid = [raws[0]] + [np.zeros_like(raws[0])] * 4
+            curr_matches, _ = match_tha(grid, raws_grid, psd_arr, hcomps, stilde,
                                         template_params['num_comps'],
                                         low_frequency_cutoff=f_lower,
-                                        stilde_norm=s_norm)
+                                        stilde_norm=s_norm,
+                                        n_psi=options.marg_n_psi)
+            if grid_files is not None and grid is None:
+                curr_matches = list(curr_matches) + [0.] * 9   # not in grid
             if aligned_flag:
                 curr_matches[1] = curr_matches[0]
                 curr_matches[2] = curr_matches[0]
                 curr_matches[3] = curr_matches[0]
                 curr_matches[4] = curr_matches[0]
+                if len(curr_matches) > 9:
+                    # same for the flat grid columns (k = 2..5 -> k = 1)
+                    for c in range(10, 14):
+                        curr_matches[c] = curr_matches[9]
 
             matches.append(curr_matches)
     prog.close()
+    if wf_pool is not None:
+        wf_pool.close()
+        wf_pool.join()
 
 logging.info("Determining maximum overlaps and outputting results")
 
 # Find the maximum overlap in the bank and output to a file
 with open(options.out_file, "w") as fout:
     for i, (stilde, s_norm, matches, sim_template) in enumerate(signals):
-        matches = array(matches)
-        match_str = "%5.5f " % max(matches[:,0])
-        match_str += "%5.5f " % max(matches[:,1])
-        match_str += "%5.5f " % max(matches[:,2])
-        match_str += "%5.5f " % max(matches[:,3])
-        match_str += "%5.5f " % max(matches[:,4])
-        match_str += "%5.5f " % max(matches[:,5])
-        match_str += "%5.5f " % max(matches[:,6])
-        match_str += "%5.5f " % max(matches[:,7])
-        match_str += "%5.5f " % max(matches[:,8])
+        vals, idx = matches.vals, matches.idx
+        match_str = "".join("%5.5f " % vals[c] for c in range(9))
         match_str += " " + options.bank_file
-        match_str += " " + str(matches[:,0].argmax())
-        match_str += " " + str(matches[:,1].argmax())
-        match_str += " " + str(matches[:,2].argmax())
-        match_str += " " + str(matches[:,3].argmax())
-        match_str += " " + str(matches[:,4].argmax())
-        match_str += " " + str(matches[:,5].argmax())
-        match_str += " " + str(matches[:,6].argmax())
-        match_str += " " + str(matches[:,7].argmax())
-        match_str += " " + str(matches[:,8].argmax())
+        match_str += "".join(" " + str(idx[c]) for c in range(9))
         match_str += " " + options.sim_file
         match_str += " %d" % i
-        match_str += " %5.5f\n" % s_norm
-        fout.write(match_str)
+        match_str += " %5.5f" % s_norm
+        if grid_files is not None:
+            # grid SNR fitting factors (same 9-column layout), then argmaxes
+            for c in range(9, 18):
+                match_str += " %5.5f" % vals[c]
+            for c in range(9, 18):
+                match_str += " " + str(idx[c])
+        fout.write(match_str + "\n")

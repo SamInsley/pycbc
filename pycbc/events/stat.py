@@ -35,6 +35,7 @@ from . import ranking
 from . import coinc_rate
 from .eventmgr_cython import logsignalrateinternals_computepsignalbins
 from .eventmgr_cython import logsignalrateinternals_compute2detrate
+from .eventmgr_cython import marglogsignalrateinternals_computepsignalbins
 
 logger = logging.getLogger("pycbc.events.stat")
 
@@ -2387,6 +2388,437 @@ class PhaseTDTHAStatistic(QuadratureSumStatistic):
         return s1 ** 0.5
 
 
+class PhaseTDMARGStatistic(QuadratureSumStatistic):
+    """
+    Statistic that re-weights combined newsnr using coinc parameters.
+
+    The weighting is based on the PDF of time delays, phase differences,
+    amplitude ratios and best-fit (theta_jn, alpha0, psi) grid points between
+    triggers in different ifos. Precessing templates use a normalizing-flow
+    model conditioned on the template opening angle beta; aligned-spin
+    templates (beta = 0 or pi), for which every grid point is equivalent, use
+    a separate flow over time, phase and amplitude ratio only.
+    """
+
+    def __init__(self, sngl_ranking, files=None, ifos=None,
+                 pregenerate_hist=True, num_comps=5, seed=None, **kwargs):
+        """
+        Create a statistic class instance
+
+        Parameters
+        ----------
+        sngl_ranking: str
+            The name of the ranking to use for the single-detector triggers.
+
+        files: list of strs, unused here
+            A list containing the filenames of hdf format files used to help
+            construct the coincident statistics. The files must have a 'stat'
+            attribute which is used to associate them with the appropriate
+            statistic class.
+
+        ifos: list of strs, needed here
+            The list of detector names
+
+        pregenerate_hist: bool, optional
+            If False, do not pregenerate histogram on class instantiation.
+            Default is True.
+
+        seed: int, optional
+            Seed for the random jitter used to dequantize the grid points.
+        """
+
+        QuadratureSumStatistic.__init__(self, sngl_ranking, files=files,
+                                        ifos=ifos, **kwargs)
+
+        self.single_dtype = [
+            ('snglstat', numpy.float32),
+            ('coa_phase', numpy.float32),
+            ('coa_phase_comp_1', numpy.float32),
+            ('coa_phase_comp_2', numpy.float32),
+            ('coa_phase_comp_3', numpy.float32),
+            ('coa_phase_comp_4', numpy.float32),
+            ('coa_phase_comp_5', numpy.float32),
+            ('end_time', numpy.float64),
+            ('sigmasq', numpy.float32),
+            ('snr', numpy.float32),
+            ('snr_comp_1', numpy.float32),
+            ('snr_comp_2', numpy.float32),
+            ('snr_comp_3', numpy.float32),
+            ('snr_comp_4', numpy.float32),
+            ('snr_comp_5', numpy.float32),
+            ('marg_lnl', numpy.float32),
+            ('marg_snr', numpy.float32),
+            ('marg_phase', numpy.float32),
+            ('marg_theta', numpy.float32),
+            ('marg_alpha', numpy.float32),
+            ('marg_psi', numpy.float32),
+            ('beta', numpy.float32),
+        ]
+
+        # Random jitter used to dequantize the best-fit grid points
+        self.rng = numpy.random.default_rng(
+            None if seed is None else int(seed))
+        self.has_hist = False
+        self.hist_ifos = None
+        self.ref_snr = 5.0
+        self.relsense = {}
+
+        # Grid spacings used for the dequantizing jitter
+        self.dalpha = numpy.pi / 12      # 2 pi / n_alpha
+        self.dpsi = numpy.pi / 16        # pi / n_psi
+        self.dcostheta = 1. / 12         # 2 / n_theta
+
+        # Some memory
+        self.pdif = numpy.zeros(128, dtype=numpy.float64)
+        self.tdif = numpy.zeros(128, dtype=numpy.float64)
+        self.sdif = numpy.zeros(128, dtype=numpy.float64)
+        self.adif = numpy.zeros(128, dtype=numpy.float64)
+        self.psidif = numpy.zeros(128, dtype=numpy.float64)
+        self.thetadif = numpy.zeros(128, dtype=numpy.float64)
+
+        if pregenerate_hist and not len(ifos) == 1:
+            self.get_hist()
+
+    @staticmethod
+    def _log_prob_chunked(model, x, conditional=None, chunk=20000):
+        """model.log_prob in chunks, to bound the flow's memory use"""
+        out = numpy.empty(len(x), dtype=numpy.float64)
+        for i in range(0, len(x), chunk):
+            c = None if conditional is None else conditional[i:i + chunk]
+            out[i:i + chunk] = model.log_prob(x[i:i + chunk], conditional=c)
+        return out
+
+    @staticmethod
+    def is_aligned(beta):
+        """Aligned-spin templates have beta = 0 or pi (no in-plane spin)."""
+        beta = numpy.asarray(beta, dtype=numpy.float64)
+        return (beta < 1e-6) | (beta > numpy.pi - 1e-6)
+
+    def get_hist(self, ifos=None, num_comps=None):
+        """
+        Read in the signal density models for the ifo combination
+
+        Three normalizing-flow models are read: 'phasetdtha_newsnr_<IFOS>' for
+        precessing templates, 'phasetdtha_aligned_newsnr_<IFOS>' for
+        aligned-spin templates, and 'phasetdtha_noise_newsnr_<IFOS>', the
+        noise density of the (dpsi, dtheta) features for precessing
+        templates.
+
+        Parameters
+        ----------
+        ifos: list
+            The list of ifos. Needed if not given when initializing the class
+            instance.
+        """
+
+        ifos = ifos or self.ifos
+
+        if len(ifos) == 1:
+            # We dont need the histogram file, but we are trying to get one
+            # just skip it in this case
+            return
+
+        def select(tag):
+            # Pick out the statistic file with this tag for the ifos in use
+            for name in self.files:
+                if tag not in name:
+                    continue
+                ifokey = name.split('_')[-1]
+                if len(ifokey) / 2 != len(ifos):
+                    continue
+                if all(ifo in ifokey for ifo in ifos):
+                    return name
+            raise RuntimeError("Couldn't figure out which %s stat file to use"
+                               % tag)
+
+        selected = select('phasetdtha_newsnr')
+        selected_aligned = select('phasetdtha_aligned_newsnr')
+        selected_noise = select('phasetdtha_noise_newsnr')
+        logger.info("Using signal models %s (precessing) and %s (aligned), "
+                    "and noise model %s, for ifos %s", selected,
+                    selected_aligned, selected_noise, ifos)
+
+        from .ml_stat import MLStatistic
+
+        self.model = MLStatistic.from_file(self.files[selected],
+                                           group_name="model")
+        self.model_aligned = MLStatistic.from_file(self.files[selected_aligned],
+                                                   group_name="model")
+        # Noise density of (dpsi, dtheta) per ifo pair, conditioned on beta
+        self.model_noise = MLStatistic.from_file(self.files[selected_noise],
+                                                 group_name="model")
+        self.model_ifos = self.model.metadata.get("ifos")
+        self.model_relfac = self.model.metadata.get("relfac")
+        # Maximum flow log density over the training samples (log units)
+        self.hist_max = float(self.model.metadata.get("hist_max"))
+        self.hist_max_aligned = float(
+            self.model_aligned.metadata.get("hist_max"))
+        self.hist_ifos = self.model_ifos
+
+        for ifo, sense in zip(self.model_ifos, self.model_relfac):
+            self.relsense[ifo] = sense
+
+        self.has_hist = True
+
+    def logsignalrate(self, stats, shift, to_shift):
+        """
+        Calculate the normalized log rate density of signals via lookup
+
+        Parameters
+        ----------
+        stats: dict of dicts
+            Single-detector quantities for each detector
+        shift: numpy array of float
+            Time shift vector for each coinc to be ranked
+        to_shift: list of ints
+            Multiple of the time shift to apply, ordered as self.ifos
+
+        Returns
+        -------
+        value: log of coinc signal rate density for the given single-ifo
+            triggers and time shifts
+        """
+        # Convert time shift vector to dict, as hist ifos and self.ifos may
+        # not be in same order
+        to_shift = {ifo: s for ifo, s in zip(self.ifos, to_shift)}
+
+        if not self.has_hist:
+            self.get_hist()
+
+        def get(ifo, key, dtype=numpy.float32):
+            return numpy.array(stats[ifo][key], dtype=dtype, ndmin=1)
+
+        ifos = self.model_ifos
+        ref_ifo = ifos[0]
+        other_ifos = [ifo for ifo in ifos if ifo != ref_ifo]
+
+        # Single-ifo information. The SNR is sqrt(2 marg_lnl), the same
+        # quantity as the single-ifo noise model.
+        ps = {ifo: get(ifo, 'marg_phase') for ifo in ifos}
+        ts = {ifo: get(ifo, 'end_time', numpy.float64) for ifo in ifos}
+        ss = {ifo: numpy.sqrt(2. * numpy.maximum(
+                  get(ifo, 'marg_lnl', numpy.float64), 1e-30)
+              ).astype(numpy.float32) for ifo in ifos}
+        sigs = {ifo: get(ifo, 'sigmasq') for ifo in ifos}
+        mal = {ifo: get(ifo, 'marg_alpha') for ifo in ifos}
+        mpsi = {ifo: get(ifo, 'marg_psi') for ifo in ifos}
+        mthe = {ifo: get(ifo, 'marg_theta') for ifo in ifos}
+
+        # Dequantize the best-fit grid points: uniform jitter within one grid
+        # cell (theta_jn is gridded uniformly in cos(theta_jn))
+        for ifo in ifos:
+            size = mal[ifo].shape
+            mal[ifo] = (mal[ifo] + self.rng.uniform(-.5, .5, size=size)
+                        * self.dalpha).astype(numpy.float32)
+            mpsi[ifo] = (mpsi[ifo] + self.rng.uniform(-.5, .5, size=size)
+                         * self.dpsi).astype(numpy.float32)
+            costheta = (numpy.cos(mthe[ifo].astype(numpy.float64))
+                        + self.rng.uniform(-.5, .5, size=size)
+                        * self.dcostheta)
+            mthe[ifo] = numpy.arccos(numpy.clip(costheta, -1., 1.)
+                                     ).astype(numpy.float32)
+
+        # Differences relative to the reference ifo
+        length = len(ts[ref_ifo])
+        while length > len(self.pdif):
+            newlen = len(self.pdif) * 2
+            self.pdif = numpy.zeros(newlen, dtype=numpy.float64)
+            self.tdif = numpy.zeros(newlen, dtype=numpy.float64)
+            self.sdif = numpy.zeros(newlen, dtype=numpy.float64)
+            self.adif = numpy.zeros(newlen, dtype=numpy.float64)
+            self.psidif = numpy.zeros(newlen, dtype=numpy.float64)
+            self.thetadif = numpy.zeros(newlen, dtype=numpy.float64)
+
+        binned = []
+        for ifo in other_ifos:
+            marglogsignalrateinternals_computepsignalbins(
+                self.pdif,
+                self.tdif,
+                self.sdif,
+                self.adif,
+                self.psidif,
+                self.thetadif,
+                ps[ifo],
+                ts[ifo],
+                ss[ifo],
+                mal[ifo],
+                mpsi[ifo],
+                mthe[ifo],
+                sigs[ifo],
+                ps[ref_ifo],
+                ts[ref_ifo],
+                ss[ref_ifo],
+                mal[ref_ifo],
+                mpsi[ref_ifo],
+                mthe[ref_ifo],
+                sigs[ref_ifo],
+                shift,
+                self.relsense[ifo],
+                self.relsense[ref_ifo],
+                to_shift[ref_ifo],
+                to_shift[ifo],
+                length,
+            )
+            binned += [
+                self.tdif[:length].copy(),
+                self.pdif[:length].copy(),
+                self.sdif[:length].copy(),
+                self.adif[:length].copy(),
+                self.psidif[:length].copy(),
+                self.thetadif[:length].copy(),
+            ]
+        x = numpy.column_stack(binned)
+
+        # The template (and so beta) is the same in every ifo
+        beta = get(ref_ifo, 'beta', numpy.float64)
+        aligned = self.is_aligned(beta)
+        rate = numpy.zeros(length, dtype=numpy.float64)
+
+        # Precessing templates: all features, conditioned on beta
+        prec = ~aligned
+        if prec.any():
+            xp = x[prec]
+            rate_p = self._log_prob_chunked(
+                self.model, xp,
+                conditional=beta[prec][:, None].astype(numpy.float32))
+            # Jacobian from log SNR ratio to SNR ratio
+            rate_p -= xp[:, 2::6].sum(axis=1)
+            # Correct for each ifo having been marginalized over the
+            # orientation grid separately
+            margs = numpy.array([get(ifo, 'marg_lnl', numpy.float64)[prec]
+                                 for ifo in ifos])
+            max_margs = numpy.array([get(ifo, 'marg_snr', numpy.float64)[prec]
+                                     for ifo in ifos])
+            rate_p += numpy.sum(0.5 * max_margs ** 2 - margs, axis=0)
+            # Divide by the noise density of (dpsi, dtheta): noise coincs are
+            # not uniform in these (both ifos favour the same grid points of
+            # the same template), so they are modelled by their own flow and
+            # left out of the uniform noise volume in rank_stat_coinc.
+            # Columns 4, 5 of each 6-feature pair, in the noise model's
+            # [dpsi, dtheta] order.
+            noise_cols = [c for i in range(len(other_ifos))
+                          for c in (6 * i + 4, 6 * i + 5)]
+            rate_p -= self._log_prob_chunked(
+                self.model_noise, xp[:, noise_cols],
+                conditional=beta[prec][:, None].astype(numpy.float32))
+            rate[prec] = rate_p
+
+        # Aligned-spin templates: time, phase and SNR ratio only. All grid
+        # points are equivalent, so use the phase of the first harmonic and
+        # no correction term (it is zero).
+        if aligned.any():
+            ph1 = {ifo: get(ifo, 'coa_phase_comp_1', numpy.float64)[aligned]
+                   for ifo in ifos}
+            feats = []
+            for i, ifo in enumerate(other_ifos):
+                pdif = numpy.mod(ph1[ref_ifo] - ph1[ifo], 2. * numpy.pi)
+                feats += [x[aligned, 6 * i], pdif, x[aligned, 6 * i + 2]]
+            xa = numpy.column_stack(feats)
+            rate_a = self._log_prob_chunked(self.model_aligned, xa)
+            # Jacobian from log SNR ratio to SNR ratio
+            rate_a -= xa[:, 2::3].sum(axis=1)
+            rate[aligned] = rate_a
+
+        # Jacobian for the reference SNR and SNR^-4 signal population
+        snr_ref = ss[ref_ifo].astype(numpy.float64)
+        rate -= numpy.log(snr_ref)
+        rate += numpy.log((snr_ref / self.ref_snr) ** -4.)
+
+        return rate
+
+    def single(self, trigs):
+        """
+        Calculate the necessary single detector information
+
+        Here the ranking as well as phase, endtime and sigma-squared values.
+
+        Parameters
+        ----------
+        trigs: dict of numpy.ndarrays, h5py group or similar dict-like object
+            Object holding single detector trigger information. 'snr', 'chisq',
+            'chisq_dof', 'coa_phase', 'end_time', and 'sigmasq' are required
+            keys.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of single detector parameter values
+        """
+        sngl_stat = self.get_sngl_ranking(trigs)
+        singles = numpy.zeros(len(sngl_stat), dtype=self.single_dtype)
+        singles['snglstat'] = sngl_stat
+        singles['coa_phase'] = trigs['coa_phase'][:]
+        singles['coa_phase_comp_1'] = trigs['coa_phase_comp_1'][:]
+        singles['coa_phase_comp_2'] = trigs['coa_phase_comp_2'][:]
+        singles['coa_phase_comp_3'] = trigs['coa_phase_comp_3'][:]
+        singles['coa_phase_comp_4'] = trigs['coa_phase_comp_4'][:]
+        singles['coa_phase_comp_5'] = trigs['coa_phase_comp_5'][:]
+        singles['end_time'] = trigs['end_time'][:]
+        singles['sigmasq'] = trigs['sigmasq'][:]
+        singles['snr'] = trigs['snr'][:]
+        singles['snr_comp_1'] = trigs['snr_comp_1'][:]
+        singles['snr_comp_2'] = trigs['snr_comp_2'][:]
+        singles['snr_comp_3'] = trigs['snr_comp_3'][:]
+        singles['snr_comp_4'] = trigs['snr_comp_4'][:]
+        singles['snr_comp_5'] = trigs['snr_comp_5'][:]
+        singles['marg_lnl'] = trigs['marg_lnl'][:]
+        singles['marg_snr'] = trigs['marg_snr'][:]
+        singles['marg_phase'] = trigs['marg_phase'][:]
+        singles['marg_theta'] = trigs['marg_theta'][:]
+        singles['marg_alpha'] = trigs['marg_alpha'][:]
+        singles['marg_psi'] = trigs['marg_psi'][:]
+        singles['beta'] = trigs['beta'][:]
+        return numpy.array(singles, ndmin=1)
+
+    def rank_stat_single(self, single_info):
+        """
+        Calculate the statistic for a single detector candidate
+
+        Parameters
+        ----------
+        single_info: tuple
+            Tuple containing two values. The first is the ifo (str) and the
+            second is the single detector triggers.
+
+        Returns
+        -------
+        numpy.ndarray
+            The array of single detector statistics
+        """
+        return self.single(single_info[1])
+
+    def rank_stat_coinc(self, sngls_list, slide, step, to_shift,
+                        **kwargs):  # pylint:disable=unused-argument
+        """
+        Calculate the coincident detection statistic, defined in Eq 2 of
+        [Nitz et al, 2017](https://doi.org/10.3847/1538-4357/aa8f50).
+        """
+        rstat = sum(s[1]['snglstat'] ** 2 for s in sngls_list)
+        cstat = rstat + 2. * self.logsignalrate(dict(sngls_list),
+                                                slide * step,
+                                                to_shift)
+        cstat[cstat < 0] = 0
+        return cstat ** 0.5
+
+    def coinc_lim_for_thresh(self, sngls_list, thresh, limifo,
+                             **kwargs):  # pylint:disable=unused-argument
+        """
+        Optimization function to identify coincs too quiet to be of interest.
+        Calculate the required single detector statistic to exceed the
+        threshold for each of the input triggers.
+        """
+        # Safety against subclassing and not rethinking this
+        allowed_names = ['PhaseTDMARGStatistic']
+        self._check_coinc_lim_subclass(allowed_names)
+
+        if not self.has_hist:
+            self.get_hist()
+
+        lim_stat = [b['snglstat'] for a, b in sngls_list if a == limifo][0]
+        # No reliable upper bound on logsignalrate yet (correction term and
+        # SNR^-4 term are not included in hist_max), so do not pre-filter.
+        return numpy.zeros_like(lim_stat)
+
 # FIXME: This class (and probably the one above) need properly integrating into
 #        the new statistic system. Much duplication present here.
 class ExpFitFgBgNormTHAStatistic(PhaseTDTHAStatistic,
@@ -2725,6 +3157,365 @@ class ExpFitFgBgNormTHAStatistic(PhaseTDTHAStatistic,
         loglr = - thresh + network_logvol - ln_noise_rate + logr_s - logr_n
         return loglr
 
+# FIXME: This class (and probably the one above) need properly integrating into
+#        the new statistic system. Much duplication present here.
+class ExpFitFgBgNormMARGStatistic(PhaseTDMARGStatistic,
+                                 ExpFitStatistic):
+    """
+    Statistic combining PhaseTD, ExpFitBg and additional foreground info.
+    """
+
+    def __init__(self, sngl_ranking, files=None, ifos=None,
+                 reference_ifos='H1,L1', num_comps=5, **kwargs):
+        """
+        Create a statistic class instance
+
+        Parameters
+        ----------
+        sngl_ranking: str
+            The name of the ranking to use for the single-detector triggers.
+        files: list of strs, needed here
+            A list containing the filenames of hdf format files used to help
+            construct the coincident statistics. The files must have a 'stat'
+            attribute which is used to associate them with the appropriate
+            statistic class.
+        ifos: list of strs
+            The list of detector names
+        reference_ifos: string of comma separated ifo prefixes
+            Detectors to be used as the reference network for network
+            sensitivity comparisons. Each must be in fits_by_tid
+        """
+        # FIXME: Currently hardcoded to True. This statistic does not support the
+        #        statistic features options at present. Do *NOT* give them!!
+        kwargs['normalize_fit_rate'] = True
+
+        # read in background fit info and store it
+        ExpFitStatistic.__init__(self, sngl_ranking, files=files,
+                                 ifos=ifos, **kwargs)
+        # if ifos not already set, determine via background fit info
+        self.ifos = self.ifos or self.bg_ifos
+        self.num_comps = int(num_comps)
+
+        # PhaseTD statistic single_dtype plus network sensitivity benchmark
+        PhaseTDMARGStatistic.__init__(self, sngl_ranking, files=files,
+                                      ifos=self.ifos, num_comps=num_comps,
+                                      **kwargs)
+        self.single_dtype.append(('benchmark_logvol', numpy.float32))
+
+        for ifo in self.bg_ifos:
+            self.assign_median_sigma(ifo)
+
+        ref_ifos = reference_ifos.split(',')
+
+        # benchmark_logvol is a benchmark sensitivity array over template id
+        hl_net_med_sigma = numpy.amin([self.fits_by_tid[ifo]['median_sigma']
+                                       for ifo in ref_ifos], axis=0)
+        self.benchmark_logvol = 3.0 * numpy.log(hl_net_med_sigma)
+        self.single_increasing = False
+
+    def assign_median_sigma(self, ifo):
+        """
+        Read and sort the median_sigma values from input files.
+
+        Parameters
+        ----------
+        ifo: str
+            The ifo to consider.
+        """
+
+        with h5py.File(self.files[f'{ifo}-fit_coeffs'], 'r') as coeff_file:
+            template_id = coeff_file['template_id'][:]
+            tid_sort = numpy.argsort(template_id)
+            self.fits_by_tid[ifo]['median_sigma'] = \
+                coeff_file['median_sigma'][:][tid_sort]
+
+    def lognoiserate(self, trigs, alphabelow=6):
+        """
+        Calculate the log noise rate density over single-ifo ranking
+
+        Read in single trigger information, make the newsnr statistic
+        and rescale by the fitted coefficients alpha and rate
+
+        Parameters
+        -----------
+        trigs: dict of numpy.ndarrays, h5py group (or similar dict-like object)
+            Dictionary-like object holding single detector trigger information.
+        alphabelow: float, default=6
+            Use this slope to fit the noise triggers below the point at which
+            fits are present in the input files.
+
+        Returns
+        ---------
+        lognoisel: numpy.array
+            Array of log noise rate density for each input trigger.
+        """
+        # What is the template number currently being used?
+        try:
+            # exists if accessed via coinc_findtrigs, this is a number
+            self.curr_tnum = trigs.template_num
+        except AttributeError:
+            # exists for SingleDetTriggers & pycbc_live get_coinc,
+            # this is a numpy array
+            self.curr_tnum = trigs["template_id"]
+
+        alphai, ratei, thresh = self.find_fits(trigs)
+        newsnr = self.get_sngl_ranking(trigs)
+        # Above the threshold we use the usual fit coefficient (alpha)
+        # below threshold use specified alphabelow
+        bt = newsnr < thresh
+        lognoisel = - alphai * (newsnr - thresh) + numpy.log(alphai) + \
+                        numpy.log(ratei)
+        lognoiselbt = - alphabelow * (newsnr - thresh) + \
+                           numpy.log(alphabelow) + numpy.log(ratei)
+        lognoisel[bt] = lognoiselbt[bt]
+        return numpy.array(lognoisel, ndmin=1, dtype=numpy.float32)
+
+    def single(self, trigs):
+        """
+        Calculate the necessary single detector information
+
+        In this case the ranking rescaled (see the lognoiserate method here)
+        with the phase, end time, sigma, SNR, template_id and the
+        benchmark_logvol values added in.
+
+        Parameters
+        ----------
+        trigs: dict of numpy.ndarrays, h5py group (or similar dict-like object)
+            Dictionary-like object holding single detector trigger information.
+        Returns
+        -------
+        numpy.ndarray
+            The array of single detector values
+        """
+
+        # single-ifo stat = log of noise rate
+        sngl_stat = self.lognoiserate(trigs)
+        # populate other fields to calculate phase/time/amp consistency
+        # and sigma comparison
+        singles = numpy.zeros(len(sngl_stat), dtype=self.single_dtype)
+        singles['snglstat'] = sngl_stat
+        singles['coa_phase'] = trigs['coa_phase'][:]
+        singles['coa_phase_comp_1'] = trigs['coa_phase_comp_1'][:]
+        singles['coa_phase_comp_2'] = trigs['coa_phase_comp_2'][:]
+        singles['coa_phase_comp_3'] = trigs['coa_phase_comp_3'][:]
+        singles['coa_phase_comp_4'] = trigs['coa_phase_comp_4'][:]
+        singles['coa_phase_comp_5'] = trigs['coa_phase_comp_5'][:]
+        singles['end_time'] = trigs['end_time'][:]
+        singles['sigmasq'] = trigs['sigmasq'][:]
+        singles['snr'] = trigs['snr'][:]
+        singles['snr_comp_1'] = trigs['snr_comp_1'][:]
+        singles['snr_comp_2'] = trigs['snr_comp_2'][:]
+        singles['snr_comp_3'] = trigs['snr_comp_3'][:]
+        singles['snr_comp_4'] = trigs['snr_comp_4'][:]
+        singles['snr_comp_5'] = trigs['snr_comp_5'][:]
+        singles['marg_lnl'] = trigs['marg_lnl'][:]
+        singles['marg_snr'] = trigs['marg_snr'][:]
+        singles['marg_phase'] = trigs['marg_phase'][:]
+        singles['marg_theta'] = trigs['marg_theta'][:]
+        singles['marg_alpha'] = trigs['marg_alpha'][:]
+        singles['marg_psi'] = trigs['marg_psi'][:]
+        singles['beta'] = trigs['beta'][:]
+        try:
+            tnum = trigs.template_num  # exists if accessed via coinc_findtrigs
+        except AttributeError:
+            tnum = trigs['template_id']  # exists for SingleDetTriggers
+            # Should only be one ifo fit file provided
+            assert len(self.ifos) == 1
+        # Store benchmark log volume as single-ifo information since the coinc
+        # method does not have access to template id
+        singles['benchmark_logvol'] = self.benchmark_logvol[tnum]
+        return numpy.array(singles, ndmin=1)
+
+    def rank_stat_single(self, single_info):
+        """
+        Calculate the statistic for single detector candidates
+
+        Parameters
+        ----------
+        single_info: tuple
+            Tuple containing two values. The first is the ifo (str) and the
+            second is the single detector triggers.
+
+        Returns
+        -------
+        numpy.ndarray
+            The array of single detector statistics
+        """
+        sngls = single_info[1]
+
+        ln_noise_rate = sngls['snglstat']
+        ln_noise_rate -= self.benchmark_lograte
+        network_sigmasq = sngls['sigmasq']
+        network_logvol = 1.5 * numpy.log(network_sigmasq)
+        benchmark_logvol = sngls['benchmark_logvol']
+        network_logvol -= benchmark_logvol
+        ln_s = -4 * numpy.log(sngls['snr'] / self.ref_snr)
+        loglr = network_logvol - ln_noise_rate + ln_s
+        # cut off underflowing and very small values
+        loglr[loglr < -30.] = -30.
+        return loglr
+
+    def rank_stat_coinc(self, s, slide, step, to_shift,
+                        **kwargs): # pylint:disable=unused-argument
+        """
+        Calculate the coincident detection statistic.
+
+        Parameters
+        ----------
+        sngls_list: list
+            List of (ifo, single detector statistic) tuples
+        slide: (unused in this statistic)
+        step: (unused in this statistic)
+        to_shift: list
+            List of integers indicating what multiples of the time shift will
+            be applied (unused in this statistic)
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of coincident ranking statistic values
+        """
+
+        sngl_rates = {sngl[0]: sngl[1]['snglstat'] for sngl in s}
+        ln_noise_rate = coinc_rate.combination_noise_lograte(
+                                  sngl_rates, kwargs['time_addition'])
+        ln_noise_rate -= self.benchmark_lograte
+
+        # Network sensitivity for a given coinc type is approximately
+        # determined by the least sensitive ifo
+        network_sigmasq = numpy.amin([sngl[1]['sigmasq'] for sngl in s],
+                                     axis=0)
+        # Volume \propto sigma^3 or sigmasq^1.5
+        network_logvol = 1.5 * numpy.log(network_sigmasq)
+        # Get benchmark log volume as single-ifo information :
+        # benchmark_logvol for a given template is not ifo-dependent, so
+        # choose the first ifo for convenience
+        benchmark_logvol = s[0][1]['benchmark_logvol']
+        network_logvol -= benchmark_logvol
+
+        # Use prior histogram to get Bayes factor for signal vs noise
+        # given the time, phase and SNR differences between IFOs
+
+        # First get signal PDF logr_s
+        stat = {ifo: st for ifo, st in s}
+        logr_s = self.logsignalrate(stat, slide * step, to_shift)
+
+        # Find total volume of phase-time-amplitude space occupied by noise
+        # coincs
+        # Extent of time-difference space occupied
+        noise_twindow = coinc_rate.multiifo_noise_coincident_area(
+                            self.hist_ifos, kwargs['time_addition'])
+        # Volume is the allowed time difference window, multiplied by 2pi for
+        # each phase difference dimension and by allowed range of SNR ratio
+        # for each SNR ratio dimension : there are (n_ifos - 1) dimensions
+        # for both phase and SNR
+        n_ifos = len(self.hist_ifos)
+        # (dpsi, dtheta) are not in the uniform volume: their noise density
+        # is a flow, divided out in logsignalrate
+        hist_vol = noise_twindow * \
+            (2 * numpy.pi            # phase difference
+             * 2 * numpy.pi          # alpha0 difference
+             ) ** (n_ifos - 1)
+        # Aligned-spin templates have no orientation features: only the time
+        # and phase differences are spanned
+        hist_vol_aligned = noise_twindow * (2 * numpy.pi) ** (n_ifos - 1)
+        # Noise PDF is 1/volume, assuming a uniform distribution of noise
+        # coincs
+        aligned = self.is_aligned(s[0][1]['beta'])
+        logr_n = numpy.where(aligned, - numpy.log(hist_vol_aligned),
+                             - numpy.log(hist_vol))
+
+        # Combine to get final statistic: log of
+        # ((rate of signals / rate of noise) * PTA Bayes factor)
+        loglr = network_logvol - ln_noise_rate + logr_s - logr_n
+
+        # cut off underflowing and very small values
+        loglr[loglr < -30.] = -30.
+        return loglr
+
+    def coinc_lim_for_thresh(self, s, thresh, limifo,
+                             **kwargs): # pylint:disable=unused-argument
+        """
+        Optimization function to identify coincs too quiet to be of interest
+
+        Calculate the required single detector statistic to exceed
+        the threshold for each of the input triggers.
+
+        Parameters
+        ----------
+        s: list
+            List of (ifo, single detector statistic) tuples for all detectors
+            except limifo.
+        thresh: float
+            The threshold on the coincident statistic.
+        limifo: string
+            The ifo for which the limit is to be found.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of limits on the limifo single statistic to
+            exceed thresh.
+        """
+
+        # Safety against subclassing and not rethinking this
+        allowed_names = ['ExpFitFgBgNormMARGStatistic']
+        self._check_coinc_lim_subclass(allowed_names)
+
+        if not self.has_hist:
+            self.get_hist()
+        # if the threshold is below this value all triggers will
+        # pass because of rounding in the coinc method
+        if thresh <= -30:
+            return numpy.ones(len(s[0][1]['snglstat'])) * numpy.inf
+        sngl_rates = {sngl[0]: sngl[1]['snglstat'] for sngl in s}
+        # Add limifo to singles dict so that overlap time is calculated correctly
+        sngl_rates[limifo] = numpy.zeros(len(s[0][1]))
+        ln_noise_rate = coinc_rate.combination_noise_lograte(
+                                  sngl_rates, kwargs['time_addition'])
+        ln_noise_rate -= self.benchmark_lograte
+
+        # Assume best case and use the maximum sigma squared from all triggers
+        network_sigmasq = numpy.ones(len(s[0][1])) * kwargs['max_sigmasq']
+        # Volume \propto sigma^3 or sigmasq^1.5
+        network_logvol = 1.5 * numpy.log(network_sigmasq)
+        # Get benchmark log volume as single-ifo information :
+        # benchmark_logvol for a given template is not ifo-dependent, so
+        # choose the first ifo for convenience
+        benchmark_logvol = s[0][1]['benchmark_logvol']
+        network_logvol -= benchmark_logvol
+
+        # The template (so beta) is the same for every trigger here
+        aligned = self.is_aligned(s[0][1]['beta'])
+
+        # Assume best case scenario and use maximum signal rate: the flow's
+        # maximum log density (hist_max is already in log units) for the
+        # model this template uses, times the SNR^-4 population factor
+        logr_s = (numpy.where(aligned, self.hist_max_aligned, self.hist_max)
+                  - 4. * numpy.log(kwargs['min_snr'] / self.ref_snr))
+
+        # Find total volume of phase-time-amplitude space occupied by noise
+        # coincs, as in rank_stat_coinc
+        noise_twindow = coinc_rate.multiifo_noise_coincident_area(
+                            self.hist_ifos, kwargs['time_addition'])
+        n_ifos = len(self.hist_ifos)
+        # (dpsi, dtheta) are not in the uniform volume: their noise density
+        # is a flow, divided out in logsignalrate
+        hist_vol = noise_twindow * \
+            (2 * numpy.pi            # phase difference
+             * 2 * numpy.pi          # alpha0 difference
+             ) ** (n_ifos - 1)
+        hist_vol_aligned = noise_twindow * (2 * numpy.pi) ** (n_ifos - 1)
+        # Noise PDF is 1/volume, assuming a uniform distribution of noise
+        # coincs
+        logr_n = numpy.where(aligned, - numpy.log(hist_vol_aligned),
+                             - numpy.log(hist_vol))
+
+        loglr = - thresh + network_logvol - ln_noise_rate + logr_s - logr_n
+        return loglr
+
+    
+    
 statistic_dict = {
     "quadsum": QuadratureSumStatistic,
     "single_ranking_only": QuadratureSumStatistic,
@@ -2732,6 +3523,7 @@ statistic_dict = {
     "exp_fit_csnr": ExpFitCombinedSNR,
     "exp_fit": ExpFitStatistic,
     "phasetd_exp_fit_fgbg_norm_tha": ExpFitFgBgNormTHAStatistic,
+    "phasetd_exp_fit_fgbg_norm_marg": ExpFitFgBgNormMARGStatistic,
 }
 
 

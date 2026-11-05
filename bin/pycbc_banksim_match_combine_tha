@@ -61,24 +61,29 @@ parser.add_argument("--filter-func-file", default=None,
                          "as numpy arrays.")
 options = parser.parse_args()
 
-dtypem = np.dtype([('match_1', np.float64), ('match_2', np.float64),
-                ('match_3', np.float64), ('match_4', np.float64),
-                ('match_5', np.float64), ('match_vary', np.float64),
-                ('match_vary_max2', np.float64),
-                ('match_vary_max3', np.float64),
-                ('match_vary_max4', np.float64), ('bank_1', np.unicode_, 256),
-                ('bank_2', np.unicode_, 256), ('bank_3', np.unicode_, 256),
-                ('bank_4', np.unicode_, 256), ('bank_5', np.unicode_, 256),
-                ('bank_vary', np.unicode_, 256),
-                ('bank_vary_max2', np.unicode_, 256),
-                ('bank_vary_max3', np.unicode_, 256), 
-                ('bank_vary_max4', np.unicode_, 256),
-                ('bank_i_1', np.int32), ('bank_i_2', np.int32),
-                ('bank_i_3', np.int32), ('bank_i_4', np.int32),
-                ('bank_i_5', np.int32), ('bank_i_vary', np.int32),
-                ('bank_i_vary_max2', np.int32), ('bank_i_vary_max3', np.int32),
-                ('bank_i_vary_max4', np.int32), ('sim', np.unicode_, 256),
-                ('sim_i', np.int32), ('sigmasq', np.float64)])
+BASE_KEYS = [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']
+GRID_KEYS = ['grid_{}'.format(k) for k in BASE_KEYS]
+
+# pycbc_banksim_combine_banks_tha writes 30 columns, or 57 if the banksim
+# was run with --marginalized-grid-file (grid matches, banks, indices appended).
+ncol = len(open(options.match_files[0]).readline().split())
+if ncol == 30:
+    KEYS = BASE_KEYS
+elif ncol == 57:
+    KEYS = BASE_KEYS + GRID_KEYS
+else:
+    raise ValueError("Unexpected number of columns ({}) in {}".format(
+        ncol, options.match_files[0]))
+
+def _fields(keys):
+    return ([('match_{}'.format(k), np.float64) for k in keys] +
+            [('bank_{}'.format(k), np.str_, 256) for k in keys] +
+            [('bank_i_{}'.format(k), np.int32) for k in keys])
+fields = _fields(BASE_KEYS)
+fields += [('sim', np.str_, 256), ('sim_i', np.int32), ('sigmasq', np.float64)]
+if KEYS is not BASE_KEYS:
+    fields += _fields(GRID_KEYS)
+dtypem = np.dtype(fields)
 
 # Collect the results
 res = None
@@ -100,7 +105,7 @@ bank_params = {}
     
 bank_par_list = ['mass1', 'mass2', 'spin1x', 'spin1y', 'spin1z', 'spin2x',
                  'spin2y', 'spin2z']
-for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+for i in KEYS:
     bank_params[i] = {}
     for val in bank_par_list:
         bank_params[i][val] = np.zeros(len(res), dtype=np.float64)
@@ -114,14 +119,14 @@ for val in inj_par_list:
 
 trig_params = {}
 trig_par_list = ['match', 'sigmasq']
-for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+for i in KEYS:
     trig_params[i] = {}
     for val in trig_par_list:
         trig_params[i][val] = np.zeros(len(res), dtype=np.float64)
 
 for idx, row in enumerate(res): 
     outstr = ""
-    for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+    for i in KEYS:
         if row['bank_{}'.format(i)] not in btables:
             bank_path = row['bank_{}'.format(i)]
             temp_bank = TemplateBank(bank_path)
@@ -133,17 +138,17 @@ for idx, row in enumerate(res):
         itables[row['sim']] = table.Table.get_table(indoc, "sim_inspiral") 
     
     bts = {}
-    for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+    for i in KEYS:
         bts[i] = btables[row['bank_{}'.format(i)]][row['bank_i_{}'.format(i)]]
     it = itables[row['sim']][row['sim_i']]
  
-    for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+    for i in KEYS:
         for val in trig_par_list:
             if val == 'match':
                 trig_params[i][val][idx] = row['match_{}'.format(i)]
             else:
                 trig_params[i][val][idx] = row[val]
-    for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+    for i in KEYS:
         for val in bank_par_list:
             try:
                 bank_params[i][val][idx] = getattr(bts[i], val)
@@ -157,7 +162,7 @@ for idx, row in enumerate(res):
     for val in inj_par_list:
         inj_params[val][idx] = getattr(it, val)
 
-for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+for i in KEYS:
     for val in bank_par_list:
         f['bank_params_{}/{}'.format(i, val)] = bank_params[i][val] 
     for val in trig_par_list:
@@ -167,7 +172,7 @@ for val in inj_par_list:
     f['inj_params/{}'.format(val)] = inj_params[val]
 
 # Also consider values over the whole set
-for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+for i in KEYS:
     # Signal recovery fraction
     sigma = trig_params[i]['sigmasq']**0.5
     srfn = np.sum((trig_params[i]['match'] * sigma)**3.)

@@ -1,7 +1,7 @@
 import numpy as np
 cimport numpy as cnp
 from cython import wraparound, boundscheck, cdivision
-from libc.math cimport M_PI, sqrt
+from libc.math cimport M_PI, sqrt, log, floor
 from libc.math cimport round as cround
 
 
@@ -119,6 +119,61 @@ def logsignalrateinternals_compute2detrate(
         rescale_fac = ref_snr / sref[ridx]
         rate[ridx] *= (rescale_fac*rescale_fac*rescale_fac*rescale_fac)
 
+@boundscheck(False)
+@wraparound(False)
+@cdivision(True)
+def marglogsignalrateinternals_computepsignalbins(
+    double[:] pdif,
+    double[:] tdif,
+    double[:] sdif,
+    double[:] adif,
+    double[:] psidif,
+    double[:] thetadif,
+    float[:] p,
+    double[:] t,
+    float[:] s,
+    float[:] a,
+    float[:] psi,
+    float[:] the,
+    float[:] sig,
+    float[:] pref,
+    double[:] tref,
+    float[:] sref,
+    float[:] aref,
+    float[:] psiref,
+    float[:] thetaref,
+    float[:] sigref,
+    double[:] shift,
+    double sense,
+    double senseref,
+    int to_shift_ref,
+    int to_shift_ifo,
+    int length
+):
+    cdef:
+        int idx
+        double raw, k
+
+    for idx in range(length):
+        # psi is only defined mod pi/2: the filter at psi + pi/2 is minus the
+        # filter at psi. Fold dpsi into [-pi/4, pi/4) and add pi to the
+        # phase difference for each pi/2 step the fold moves.
+        raw = psiref[idx] - psi[idx]
+        k = floor(raw / (M_PI / 2) + 0.5)
+        psidif[idx] = raw - k * (M_PI / 2)
+        pdif[idx] = (pref[idx] - p[idx] + k * M_PI) % (M_PI * 2)
+        if pdif[idx] < 0:
+            # C modulus operator is not same as python's, correct for this
+            pdif[idx] += (M_PI * 2)
+        tdif[idx] = shift[idx] * to_shift_ref + tref[idx] - shift[idx] * to_shift_ifo - t[idx]
+        sdif[idx] = log((s[idx] * sense * sqrt(sigref[idx])) / (sref[idx] * senseref * sqrt(sig[idx])))
+        adif[idx] = (aref[idx] - a[idx] + M_PI) % (2. * M_PI)
+        if adif[idx] < 0:
+            # C modulus keeps the sign; correct as for pdif
+            adif[idx] += 2. * M_PI
+        adif[idx] -= M_PI
+        thetadif[idx] = thetaref[idx] - the[idx]
+        
 
 @boundscheck(False)
 @wraparound(False)

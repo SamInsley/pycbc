@@ -247,7 +247,8 @@ def marginalize_segment(M, hh, ln_weight, z, method='max', lookup_table=None,
     if not return_argmax:
         return result[0] if scalar_input else result
 
-    best_idx = np.argmax(lnl, axis=0)  # (n_time,)
+    lnl_max = np.max(lnl, axis=0, keepdims=True)
+    best_idx = np.argmax(lnl >= lnl_max * (1. - 1e-10), axis=0)  # (n_time,)
     n_time = dh.shape[1]
     best_dh = dh[best_idx, np.arange(n_time)]
     best_hh = hh[best_idx]

@@ -1,0 +1,450 @@
+#!/bin/env python
+
+"""
+Train a normalizing flow on the coincident time, phase, amplitude and
+best-fit (theta_jn, alpha0, psi) grid-point correlations between two or more
+detectors, for the precessing 5-harmonic (THA) marginalized search, by a
+simple monte-carlo over templates in the bank.
+
+Signals are drawn for random templates from the bank/grid files, isotropic
+sky positions and orientations, and distances uniform in volume. Each
+detector's per-harmonic SNRs get unit-variance complex Gaussian noise and are
+then marginalized over the (theta_jn, alpha0, psi) grid exactly as
+pycbc_inspiral_tha does, so the features match what PhaseTDMARGStatistic
+computes from the triggers.
+
+Two models can be made (run once for each):
+
+* default (precessing templates only): per detector pair
+  [dt, dphase, log snr ratio, dalpha, dpsi, dtheta], conditioned on the
+  template opening angle beta. Stat name 'phasetdtha_newsnr_<IFOS>'.
+* --aligned (aligned-spin templates only, beta = 0 or pi): per detector pair
+  [dt, dphase of harmonic 1, log snr ratio], no conditioning. Stat name
+  'phasetdtha_aligned_newsnr_<IFOS>'.
+
+The SNR used throughout is sqrt(2 marg_lnl), the same as the statistic.
+"""
+
+import argparse, logging
+import numpy as np
+import h5py
+import pycbc, pycbc.detector, pycbc.psd
+from scipy.special import logsumexp
+from pycbc.io import HFile
+from pycbc.waveform.bank import TemplateBank, PhenomXPTemplate, _dpsi
+from pycbc.waveform.tha_marg_grid import get_raw_harmonics
+from pycbc.filter.tha_marginalize import derive_ep_ec_hh, fold_psi
+
+try:
+    import torch
+    from pycbc.events.ml_stat import MLStatistic, NormalizingFlow
+    HAS_ML_STAT = True
+except ImportError:
+    HAS_ML_STAT = False
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+pycbc.add_common_pycbc_options(parser)
+parser.add_argument('--ifos', nargs='+', required=True,
+                    help="The ifos to generate a model for. The first is the "
+                         "reference ifo.")
+parser.add_argument('--sample-size', type=int,
+                    help="Unused, kept for workflow compatibility "
+                         "(see --nf-samples).")
+parser.add_argument('--snr-ratio', type=float,
+                    help="Unused, kept for workflow compatibility.")
+parser.add_argument('--relative-sensitivities', nargs='+', type=float,
+                    required=True,
+                    help="Numbers proportional to horizon distance or "
+                         "expected SNR at fixed distance, one for each ifo")
+parser.add_argument('--seed', type=int, default=124)
+parser.add_argument('--output-file', required=True)
+parser.add_argument('--bin-density', type=int, default=1,
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.")
+parser.add_argument('--smoothing-sigma', type=int, default=2,
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.")
+parser.add_argument('--timing-uncertainty', type=float, default=.001,
+                    help="Standard deviation (s) of the Gaussian timing error "
+                         "added to each detector's arrival time. Without it "
+                         "the time differences are sharply bounded by the "
+                         "light travel time and real coincs just outside it "
+                         "get zero signal probability. Set 0 to disable. "
+                         "[default=.001s]")
+parser.add_argument('--phase-uncertainty', type=float, default=0.25,
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.")
+parser.add_argument('--snr-reference', type=float, default=5,
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.")
+parser.add_argument('--snr-uncertainty', type=float, default=1.0,
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.")
+parser.add_argument('--weight-threshold', type=float, default=1e-10,
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.")
+parser.add_argument('--batch-size', type=int, default=2000,
+                    help="Number of samples evaluated against the full "
+                         "(theta_jn, alpha0, psi) grid at once. Limits "
+                         "memory: each sample needs ~16 bytes per grid "
+                         "point.")
+parser.add_argument('--param-bin-dtype', default='int32',
+                    help="Unused (histogram option), kept for workflow "
+                         "compatibility.",
+                    choices=['int8', 'int16', 'int32'])
+parser.add_argument('--nf-neurons', type=int, default=128,
+                    help="Number of neurons for the Normalizing Flow layers.")
+parser.add_argument('--nf-bins', type=int, default=20,
+                    help="Number of bins for the Normalizing Flow model.")
+parser.add_argument('--nf-samples', type=int, default=1000000,
+                    help="Number of training samples/epochs to fit the Flow.")
+parser.add_argument("--bank-file", type=str, required=True,
+                    help="HDF5 template bank file (as used by "
+                         "pycbc_inspiral_tha --bank-file).")
+parser.add_argument("--marginalized-grid-file", type=str, nargs='+',
+                    required=True,
+                    help="One or more marginalization grid HDF5 files (as "
+                         "written by pycbc_make_tha_marginalization_grid), "
+                         "keyed by template_hash. Pass several if the bank "
+                         "was split across jobs.")
+parser.add_argument("--psd-model", type=str, default="aLIGOZeroDetHighPower",
+                    choices=pycbc.psd.get_lalsim_psd_list(),
+                    help="Analytic PSD model to use (any name from "
+                         "pycbc.psd.get_lalsim_psd_list()). "
+                         "Default: aLIGOZeroDetHighPower.")
+parser.add_argument("--psi-gp", type=int, default=16,
+                    help="Number of polarization-angle (psi) grid points, "
+                         "uniformly spaced over [0, pi). Must match "
+                         "pycbc_inspiral_tha (n_psi). Default: 16.")
+parser.add_argument("--aligned", action="store_true",
+                    help="Train the aligned-spin model instead: use only "
+                         "aligned-spin templates (beta = 0 or pi) and the "
+                         "features [dt, dphase of harmonic 1, log snr "
+                         "ratio] per detector pair, with no beta "
+                         "conditioning.")
+parser.add_argument("--samples-per-template", type=int, default=1000,
+                    help="Number of signals drawn per randomly chosen "
+                         "template before moving to the next. Smaller "
+                         "values cover more of the bank (more beta values) "
+                         "for the same number of samples, at the cost of "
+                         "more waveform generation. Default: 1000.")
+parser.add_argument("--snr-threshold", type=float, default=4.,
+                    help="Keep only signals with sqrt(2 marg_lnl) above this "
+                         "in every ifo. Default: 4.")
+parser.add_argument("--loss-plot", type=str, default=None,
+                    help="File to save the training/validation loss vs "
+                         "epoch plot to. Default: the output file name with "
+                         "a '_loss.png' ending.")
+args = parser.parse_args()
+
+if len(args.relative_sensitivities) != len(args.ifos):
+    parser.error('--relative-sensitivities requires one numerical argument '
+                 'for each detector')
+
+pycbc.init_logging(args.verbose)
+
+if not HAS_ML_STAT:
+    raise ImportError("Normalizing Flow dependencies (torch, ml_stat) could "
+                      "not be imported.")
+
+np.random.seed(args.seed)
+rng = np.random.default_rng(args.seed)
+
+d = {ifo: pycbc.detector.Detector(ifo) for ifo in args.ifos}
+ifo0 = args.ifos[0]
+other_ifos = [ifo for ifo in args.ifos if ifo != ifo0]
+
+
+def is_aligned(beta):
+    """Same test as PhaseTDMARGStatistic.is_aligned"""
+    beta = np.asarray(beta, dtype=np.float64)
+    return (beta < 1e-6) | (beta > np.pi - 1e-6)
+
+
+# Grid files: shared attrs from the first, rows from all
+grid_files = [h5py.File(p, 'r') for p in args.marginalized_grid_file]
+ga = grid_files[0].attrs
+df, kmin, kmax = float(ga['df']), int(ga['kmin']), int(ga['kmax'])
+sample_rate, f_lower = float(ga['sample_rate']), float(ga['low_frequency_cutoff'])
+f_final = sample_rate / 2.
+theta_grid = np.asarray(ga['theta_grid'])
+alpha_grid = np.asarray(ga['alpha_grid'])
+weights_ta = np.asarray(ga['weights_ta'])
+n_theta, n_alpha = int(ga['n_theta']), int(ga['n_alpha'])
+grid_len = len(theta_grid)
+for gf, path in zip(grid_files[1:], args.marginalized_grid_file[1:]):
+    if not (np.allclose(gf.attrs['theta_grid'], theta_grid)
+            and np.allclose(gf.attrs['alpha_grid'], alpha_grid)
+            and float(gf.attrs['df']) == df):
+        raise ValueError("Grid file %s does not match %s"
+                         % (path, args.marginalized_grid_file[0]))
+
+# template_hash -> (file index, row), and the grid's beta for selection
+grid_row, grid_beta = {}, {}
+for fi, gf in enumerate(grid_files):
+    for i, (h, b) in enumerate(zip(gf['template_hash'][:], gf['beta'][:])):
+        grid_row[int(h)] = (fi, i)
+        grid_beta[int(h)] = float(b)
+
+# Read the bank via TemplateBank so hashes are interpreted the same way as
+# in pycbc_inspiral_tha
+bank = TemplateBank(args.bank_file)
+bank_row = {int(h): i for i, h in enumerate(bank.table.template_hash)}
+
+hashes = np.array([h for h in grid_row if h in bank_row
+                   and is_aligned(grid_beta[h]) == args.aligned])
+if len(hashes) == 0:
+    raise ValueError("No %s templates found in both the bank and grid files"
+                     % ('aligned-spin' if args.aligned else 'precessing'))
+logging.info("Using %d %s templates", len(hashes),
+             'aligned-spin' if args.aligned else 'precessing')
+
+# Model PSD
+psd = pycbc.psd.from_string(args.psd_model, int(f_final / df) + 1, df,
+                            f_lower).data
+
+# Grid point values, in the same flattened order as fold_psi's output
+# (index = ta_idx * psi_gp + psi_idx)
+psi_gp = args.psi_gp
+psi_grid = (np.arange(psi_gp) + 0.5) * np.pi / psi_gp
+grid_theta = np.repeat(theta_grid, psi_gp)
+grid_alpha = np.repeat(alpha_grid, psi_gp)
+grid_psi = np.tile(psi_grid, grid_len)
+
+# Grid cell sizes for the dequantizing jitter. These must match
+# PhaseTDMARGStatistic's dcostheta, dalpha and dpsi.
+dcostheta = 2. / n_theta
+dalpha = 2. * np.pi / n_alpha
+d_psi = np.pi / psi_gp
+for name, val, stat_val in [('dcostheta', dcostheta, 1. / 12),
+                            ('dalpha', dalpha, np.pi / 12),
+                            ('dpsi', d_psi, np.pi / 16)]:
+    if not np.isclose(val, stat_val):
+        logging.warning("%s = %.4g from the grid, but PhaseTDMARGStatistic "
+                        "uses %.4g: update the statistic to match",
+                        name, val, stat_val)
+
+
+def load_template(h):
+    fi, i = grid_row[h]
+    A, B = grid_files[fi]['A'][i], grid_files[fi]['B'][i]
+    tmpl = PhenomXPTemplate(bank.table[bank_row[h]], sample_rate, f_lower)
+    raws = get_raw_harmonics(tmpl, df, f_final, kmin, kmax, interp=True)
+    Ep, Ec, hh_pp, hh_cc, hh_pc = derive_ep_ec_hh(raws, A, B, psd, df,
+                                                  kmin, kmax)
+    dpsi = np.array([_dpsi(t, a, tmpl.beta)
+                     for t, a in zip(theta_grid, alpha_grid)])
+    Mf, hh, ln_w, _ = fold_psi(Ep, Ec, hh_pp, hh_cc, hh_pc, dpsi,
+                               weights_ta, psi_gp)
+    return dict(Ep=Ep, Ec=Ec, Mf=Mf, hh=hh, ln_w=ln_w, dpsi=dpsi,
+                beta=tmpl.beta)
+
+
+def marginalize(z, Mf, hh, ln_w):
+    """marg_lnl, best grid index and dh at that index, as in
+    tha_marginalize.marginalize_segment(method='max', return_argmax=True).
+    Done in chunks of --batch-size samples to limit memory."""
+    n = len(z)
+    marg_lnl = np.empty(n)
+    best = np.empty(n, dtype=int)
+    best_dh = np.empty(n, dtype=complex)
+    for s in range(0, n, args.batch_size):
+        sl = slice(s, s + args.batch_size)
+        dh = z[sl] @ Mf.T
+        lnl = np.abs(dh) ** 2 / (2. * hh)
+        marg_lnl[sl] = logsumexp(ln_w + lnl, axis=1)
+        lmax = lnl.max(axis=1, keepdims=True)
+        b = np.argmax(lnl >= lmax * (1. - 1e-10), axis=1)
+        best[sl] = b
+        best_dh[sl] = dh[np.arange(len(b)), b]
+    return marg_lnl, best, best_dh
+
+
+logging.info('Generating samples to train a normalizing flow')
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+torch.set_default_dtype(torch.float64)
+
+D_max = 900 * np.min(args.relative_sensitivities)
+size = args.samples_per_template
+order, pos = rng.permutation(hashes), 0
+xs, conds = [], []
+nkept = n_far = 0
+
+while nkept < args.nf_samples:
+    if pos == len(order):
+        order, pos = rng.permutation(hashes), 0
+    template = load_template(int(order[pos]))
+    pos += 1
+    Ep, Ec, Mf, hh, ln_w, dpsi = (template[k] for k in
+                                  ('Ep', 'Ec', 'Mf', 'hh', 'ln_w', 'dpsi'))
+
+    # Random orientation grid point, isotropic sky position, polarization
+    # and phase, and distance uniform in volume
+    ta = rng.integers(grid_len, size=size)
+    ra = rng.uniform(0, 2 * np.pi, size=size)
+    dec = np.arccos(rng.uniform(-1., 1., size=size)) - np.pi / 2
+    psi = rng.uniform(0, np.pi, size=size)
+    phi0 = rng.uniform(0, 2 * np.pi, size=size)
+    phase = np.exp(2j * phi0)
+    pol = psi - dpsi[ta]
+    distance = D_max * rng.uniform(0, 1, size=size) ** (1. / 3.)
+
+    data = {}
+    for rs, ifo in zip(args.relative_sensitivities, args.ifos):
+        fp, fc = d[ifo].antenna_pattern(ra, dec, pol, 0)
+        amp = rs / distance
+        z = (amp * phase)[:, None] * (fp[:, None] * Ep[ta] + fc[:, None] * Ec[ta])
+        # one complex unit-variance noise draw per harmonic
+        z += rng.standard_normal((size, 5)) + 1j * rng.standard_normal((size, 5))
+        marg_lnl, best, best_dh = marginalize(z, Mf, hh, ln_w)
+
+        data[ifo] = {}
+        data[ifo]['snr'] = np.sqrt(2. * np.maximum(marg_lnl, 1e-30))
+        data[ifo]['t'] = d[ifo].time_delay_from_earth_center(ra, dec, 0)
+        if args.timing_uncertainty > 0:
+            t_unc = args.timing_uncertainty * args.snr_reference / data[ifo]['snr']
+            data[ifo]['t'] += rng.normal(0, t_unc,
+                                         size=size)
+        if args.aligned:
+            # The statistic uses coa_phase_comp_1 for aligned templates
+            data[ifo]['phase'] = np.angle(z[:, 0])
+        else:
+            data[ifo]['phase'] = np.angle(best_dh)
+            # Dequantize the best-fit grid point, as in the statistic
+            costheta = (np.cos(grid_theta[best])
+                        + rng.uniform(-.5, .5, size=size) * dcostheta)
+            data[ifo]['theta'] = np.arccos(np.clip(costheta, -1, 1))
+            data[ifo]['alpha'] = (grid_alpha[best]
+                                  + rng.uniform(-.5, .5, size=size) * dalpha)
+            data[ifo]['psi'] = (grid_psi[best]
+                                + rng.uniform(-.5, .5, size=size) * d_psi)
+
+    # Same definitions and wrapping as marglogsignalrateinternals
+    bind = []
+    for ifo1 in other_ifos:
+        dt = data[ifo0]['t'] - data[ifo1]['t']
+        sr = np.log(data[ifo1]['snr'] / data[ifo0]['snr'])
+        dp = data[ifo0]['phase'] - data[ifo1]['phase']
+        if not args.aligned:
+            # psi is only defined mod pi/2 (filter at psi + pi/2 is minus the
+            # filter at psi): fold dpsi into [-pi/4, pi/4) and add pi to the
+            # phase difference for each pi/2 step the fold moves
+            raw = data[ifo0]['psi'] - data[ifo1]['psi']
+            k = np.floor(raw / (np.pi / 2) + 0.5)
+            dps = raw - k * (np.pi / 2)
+            dp = dp + k * np.pi
+        dp = dp % (2. * np.pi)
+        bind += [dt, dp, sr]
+        if not args.aligned:
+            da = (data[ifo0]['alpha'] - data[ifo1]['alpha'] + np.pi) \
+                % (2. * np.pi) - np.pi
+            dth = data[ifo0]['theta'] - data[ifo1]['theta']
+            bind += [da, dps, dth]
+
+    # Individual detector SNR cuts
+    keep = np.ones(size, dtype=bool)
+    for ifo in args.ifos:
+        keep &= data[ifo]['snr'] >= args.snr_threshold
+    if not keep.any():
+        continue
+
+    xs.append(np.column_stack(bind)[keep])
+    conds.append(np.full((keep.sum(), 1), template['beta']))
+    n_far += np.sum(distance[keep] / D_max > 0.95)
+    nkept += keep.sum()
+    logging.info('Kept %d samples (total %d)', keep.sum(), nkept)
+
+
+logging.info('Finished sampling. Starting NF training...')
+x = np.concatenate(xs)
+cond = np.concatenate(conds)
+n_dims = x.shape[1]
+n_per_pair = 3 if args.aligned else 6
+
+# Feature order per pair: [t, p, s] (+ [alpha, psi, theta] if precessing)
+bounds = []
+for i in range(n_dims):
+    j = i % n_per_pair
+    if j == 1:
+        bounds.append([0, 2 * np.pi])
+    elif j == 3:
+        bounds.append([-np.pi, np.pi])
+    elif j == 4:
+        bounds.append([-np.pi / 4, np.pi / 4])
+    elif j == 5:
+        bounds.append([-np.pi, np.pi])
+    else:
+        bounds.append([x[:, i].min() - 1e-6, x[:, i].max() + 1e-6])
+bounds = np.array(bounds, dtype=np.float32)
+
+# Training the Normalizing Flow. Increasing the training parameters should
+# improve performance at the expense of some increased cost.
+if args.aligned:
+    flow = NormalizingFlow(n_dims, bounds=bounds, n_neurons=args.nf_neurons,
+                           num_bins=args.nf_bins)
+    history = flow.fit(x, n_samples=args.nf_samples)
+    hist_max = float(np.max(flow.log_prob(x)))
+    stat_name = 'phasetdtha_aligned_newsnr_%s' % ''.join(args.ifos)
+else:
+    flow = NormalizingFlow(n_dims, bounds=bounds, context_dims=1,
+                           n_neurons=args.nf_neurons, num_bins=args.nf_bins)
+    history = flow.fit(x, conditional=cond, n_samples=args.nf_samples)
+    hist_max = float(np.max(flow.log_prob(x, conditional=cond)))
+    stat_name = 'phasetdtha_newsnr_%s' % ''.join(args.ifos)
+
+# Create the file, write the model, then add the file-level attrs (the
+# 'stat' attr is what Stat uses to find this file)
+HFile(args.output_file, 'w').close()
+ml_stat = MLStatistic(
+    model=flow,
+    metadata={
+        "stat": stat_name,
+        "hist_max": hist_max,
+        "ifos": list(args.ifos),
+        "relfac": list(args.relative_sensitivities),
+        "aligned": bool(args.aligned),
+        "dcostheta": dcostheta,
+        "dalpha": dalpha,
+        "dpsi": d_psi,
+    }
+)
+ml_stat.to_file(args.output_file, group_name="model")
+
+with HFile(args.output_file, 'a') as f:
+    f.attrs['sensitivity_ratios'] = args.relative_sensitivities
+    f.attrs['ifos'] = args.ifos
+    f.attrs['stat'] = stat_name
+    # Loss per epoch (negative mean log likelihood), for checking training
+    g = f.create_group('training_history')
+    g.create_dataset('training_loss', data=np.array(history['training_loss']))
+    g.create_dataset('validation_loss',
+                     data=np.array(history['validation_loss']))
+
+# Loss vs epoch plot
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+loss_plot = args.loss_plot
+if loss_plot is None:
+    loss_plot = args.output_file.rsplit('.', 1)[0] + '_loss.png'
+epochs = np.arange(1, len(history['training_loss']) + 1)
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(epochs, history['training_loss'], label='training')
+ax.plot(epochs, history['validation_loss'], label='validation')
+ax.set_xlabel('epoch')
+ax.set_ylabel('loss (negative mean log likelihood)')
+ax.set_title(stat_name)
+ax.legend()
+fig.tight_layout()
+fig.savefig(loss_plot, dpi=150)
+plt.close(fig)
+logging.info('Saved loss plot to %s', loss_plot)
+
+for gf in grid_files:
+    gf.close()
+
+logging.info('Done')

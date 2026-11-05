@@ -36,9 +36,7 @@ __program__ = "pycbc_banksim_combine_banks"
 _desc = __doc__[1:]
 parser = argparse.ArgumentParser(description=_desc)
 
-parser.add_argument('--version', action=pycbc.version.Version)
-parser.add_argument("--verbose", action="store_true", default=False,
-                    help="verbose output")
+pycbc.add_common_pycbc_options(parser)
 parser.add_argument("-I", "--input-files", nargs='+',
                     help="Explicit list of input files.")
 parser.add_argument("-o", "--output-file", required=True,
@@ -46,35 +44,44 @@ parser.add_argument("-o", "--output-file", required=True,
 
 options = parser.parse_args()
 
-dtypei = dtype([('match_1', float64), ('match_2', float64),
-                ('match_3', float64), ('match_4', float64),
-                ('match_5', float64), ('match_vary', float64),
-                ('match_vary_max2', float64), ('match_vary_max3', float64),
-                ('match_vary_max4', float64), ('bank', unicode_, 256),
-                ('bank_i_1', int32), ('bank_i_2', int32),
-                ('bank_i_3', int32), ('bank_i_4', int32),
-                ('bank_i_5', int32), ('bank_i_vary', int32),
-                ('bank_i_vary_max2', int32), ('bank_i_vary_max3', int32),
-                ('bank_i_vary_max4', int32), ('sim', unicode_, 256),
-                ('sim_i', int32), ('sigmasq', float64)])
+BASE_KEYS = [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']
+GRID_KEYS = ['grid_{}'.format(k) for k in BASE_KEYS]
 
-dtypeo = dtype([('match_1', float64), ('match_2', float64),
-                ('match_3', float64), ('match_4', float64),
-                ('match_5', float64), ('match_vary', float64),
-                ('match_vary_max2', float64), ('match_vary_max3', float64),
-                ('match_vary_max4', float64), ('bank_1', unicode_, 256),
-                ('bank_2', unicode_, 256), ('bank_3', unicode_, 256),
-                ('bank_4', unicode_, 256), ('bank_5', unicode_, 256),
-                ('bank_vary', unicode_, 256),
-                ('bank_vary_max2', unicode_, 256),
-                ('bank_vary_max3', unicode_, 256),
-                ('bank_vary_max4', unicode_, 256),
-                ('bank_i_1', int32), ('bank_i_2', int32),
-                ('bank_i_3', int32), ('bank_i_4', int32),
-                ('bank_i_5', int32), ('bank_i_vary', int32),
-                ('bank_i_vary_max2', int32), ('bank_i_vary_max3', int32),
-                ('bank_i_vary_max4', int32), ('sim', unicode_, 256),
-                ('sim_i', int32), ('sigmasq', float64)])
+# pycbc_banksim_tha writes 22 columns, or 40 if run with
+# --marginalized-grid-file (9 grid-constrained fitting factors and their 9
+# template indices appended at the end). Detect which from the first file.
+ncol = len(open(options.input_files[0]).readline().split())
+if ncol == 22:
+    has_grid = False
+elif ncol == 40:
+    has_grid = True
+else:
+    raise ValueError("Unexpected number of columns ({}) in {}".format(
+        ncol, options.input_files[0]))
+ALL_KEYS = BASE_KEYS + (GRID_KEYS if has_grid else [])
+
+# input: same layout as the banksim match file
+fields_i = [('match_{}'.format(k), float64) for k in BASE_KEYS]
+fields_i += [('bank', str_, 256)]
+fields_i += [('bank_i_{}'.format(k), int32) for k in BASE_KEYS]
+fields_i += [('sim', str_, 256), ('sim_i', int32), ('sigmasq', float64)]
+if has_grid:
+    fields_i += [('match_{}'.format(k), float64) for k in GRID_KEYS]
+    fields_i += [('bank_i_{}'.format(k), int32) for k in GRID_KEYS]
+dtypei = dtype(fields_i)
+
+# output: original 30 columns unchanged, grid columns appended
+def _out_fields(keys):
+    return ([('match_{}'.format(k), float64) for k in keys] +
+            [('bank_{}'.format(k), str_, 256) for k in keys] +
+            [('bank_i_{}'.format(k), int32) for k in keys])
+fields_o = _out_fields(BASE_KEYS)
+fields_o += [('sim', str_, 256), ('sim_i', int32), ('sigmasq', float64)]
+fmt = ['%5.5f'] * 9 + ['%s'] * 9 + ['%i'] * 9 + ['%s', '%i', '%5.5f']
+if has_grid:
+    fields_o += _out_fields(GRID_KEYS)
+    fmt += ['%5.5f'] * 9 + ['%s'] * 9 + ['%i'] * 9
+dtypeo = dtype(fields_o)
 
 matches=[]
 maxmatch = []
@@ -85,11 +92,9 @@ for fil in options.input_files:
 # if the user has split the injections many times.
 if array(matches, dtype=dtypei)['match_1'].ndim == 1:
     raise ValueError("Not supporting this yet")
-    index = array(matches, dtype=dtypef)['match'].argmax()
-    maxmatch.append(matches[index])
 else:
     out_arr = zeros(len(matches[0]), dtype=dtypeo)
-    for i in [1, 2, 3, 4, 5, 'vary', 'vary_max2', 'vary_max3', 'vary_max4']:
+    for i in ALL_KEYS:
         indices = array(matches, dtype=dtypei)['match_{}'.format(i)].argmax(0)
         for p, q in enumerate(indices):
             mfmt = 'match_{}'.format(i)
@@ -102,30 +107,4 @@ else:
             out_arr[p]['sim_i'] = matches[q][p]['sim_i']
             out_arr[p]['sigmasq'] = matches[q][p]['sigmasq']
 
-savetxt(options.output_file, out_arr, 
-        fmt=('%5.5f', '%5.5f','%5.5f','%5.5f','%5.5f',
-             '%5.5f', '%5.5f','%5.5f','%5.5f',
-             '%s', '%s','%s','%s','%s',
-             '%s', '%s','%s','%s',
-             '%i', '%i','%i','%i','%i',
-             '%i', '%i','%i','%i',
-             '%s', '%i', '%5.5f'), delimiter=' ')
-
-dtypeo = dtype([('match_1', float64), ('match_2', float64),
-                ('match_3', float64), ('match_4', float64),
-                ('match_5', float64), ('match_vary', float64),
-                ('match_vary_max2', float64), ('match_vary_max3', float64),
-                ('match_vary_max4', float64), ('bank_1', unicode_, 256),
-                ('bank_2', unicode_, 256), ('bank_3', unicode_, 256),
-                ('bank_4', unicode_, 256), ('bank_5', unicode_, 256),
-                ('bank_vary', unicode_, 256),
-                ('bank_vary_max2', unicode_, 256),
-                ('bank_vary_max3', unicode_, 256),
-                ('bank_vary_max4', unicode_, 256),
-                ('bank_i_1', int32), ('bank_i_2', int32),
-                ('bank_i_3', int32), ('bank_i_4', int32),
-                ('bank_i_5', int32), ('bank_i_vary', int32),
-                ('bank_i_vary_max2', int32), ('bank_i_vary_max3', int32),
-                ('bank_i_vary_max4', int32), ('sim', unicode_, 256),
-                ('sim_i', int32), ('sigmasq', float64)])
-
+savetxt(options.output_file, out_arr, fmt=tuple(fmt), delimiter=' ')
