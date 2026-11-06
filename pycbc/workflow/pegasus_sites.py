@@ -267,11 +267,21 @@ def add_osg_site(sitecat, cp):
     site.add_profiles(Namespace.CONDOR, key="Requirements",
                       value="(HAS_SINGULARITY =?= TRUE) && "
                             "(IS_GLIDEIN =?= True)")
-    cvmfs_loc = '"./tha_precession_v1_8.sif"'
+    # The Singularity image the OSG jobs run in. Set it in the config with
+    #   [pegasus_profile-osg]
+    #   pycbc|singularity-image = osdf:///igwn/cit/staging/<user>/<image>.sif
+    # The image is transferred into each job's working directory and run
+    # from there. The default keeps the previous behaviour.
+    sec = 'pegasus_profile-osg'
+    image_url = 'osdf:///igwn/cit/staging/rahul.dhurkunde/tha_precession_v1_8.sif'
+    if cp.has_option(sec, 'pycbc|singularity-image'):
+        image_url = cp.get(sec, 'pycbc|singularity-image').strip()
+    image_name = os.path.basename(urllib.parse.urlparse(image_url).path)
+    logger.info("OSG jobs will use Singularity image %s", image_url)
     site.add_profiles(Namespace.CONDOR, key="My.SingularityImage",
-                      value=cvmfs_loc)
+                      value='"./{}"'.format(image_name))
     site.add_profiles(Namespace.CONDOR, key='transfer_input_files',
-                      value='osdf:///igwn/cit/staging/rahul.dhurkunde/tha_precession_v1_8.sif')
+                      value=image_url)
     # On OSG failure rate is high
     site.add_profiles(Namespace.DAGMAN, key="retry", value="4")
     site.add_profiles(Namespace.ENV, key="LAL_DATA_PATH",
