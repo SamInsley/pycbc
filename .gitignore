@@ -19,3 +19,4 @@ pycbc/vetoes/chisq_cpu.cpp
 pycbc/waveform/decompress_cpu_cython.cpp
 pycbc/waveform/spa_tmplt_cpu.cpp
 pycbc/waveform/utils_cpu.cpp
+.ipynb_checkpoints/
