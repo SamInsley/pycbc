@@ -160,7 +160,7 @@ def resolve_url(
         # available. Thanks Dunky for the code here!
         cmd = [
             which("pelican") or "pelican", 
-            "object get", 
+            "object", "get", 
             u.scheme + "://" + u.path, 
             filename
         ]
