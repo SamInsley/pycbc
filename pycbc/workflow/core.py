@@ -89,6 +89,7 @@ class Executable(pegasus_workflow.Executable):
     # These are standard file input arguments used in PyCBC, so we declare
     # these as files if given to any PyCBC job.
     file_input_options = ['--gating-file', '--frame-files', '--injection-file',
+                          '--marginalized-grid-file',
                           '--statistic-files', '--bank-file', '--config-files',
                           '--psd-file', '--asd-file',
                           '--fake-strain-from-file',
