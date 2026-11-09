@@ -1,0 +1,143 @@
+#!/usr/bin/env python
+"""Split a combined THA marginalization grid file into one smaller grid
+file per split template bank.
+
+Each output contains only the grid rows (template_hash, A, B, beta) for the
+templates in the matching bank, plus every attribute of the input grid, so
+it can be given to pycbc_inspiral_tha --marginalized-grid-file in place of
+the full grid.
+
+The input grid is read once, from start to end, in blocks of rows, and each
+row is appended to whichever output its template belongs to. This matters
+because the split banks are usually made with --random-sort, so each bank's
+templates are scattered across the whole grid: pulling each bank's rows out
+separately would read most of the (tens of GB) grid once per bank.
+
+Template hashes are compared as unsigned 64-bit integers on both sides, so a
+hash read as signed in one place and unsigned in another still matches.
+"""
+
+import argparse
+import logging
+
+import h5py
+import numpy
+
+import pycbc
+from pycbc.waveform.bank import TemplateBank
+
+ROW_DATASETS = ['template_hash', 'A', 'B', 'beta']
+
+parser = argparse.ArgumentParser(description=__doc__)
+pycbc.add_common_pycbc_options(parser)
+parser.add_argument('--grid-file', required=True,
+                    help='Combined marginalization grid file to split.')
+parser.add_argument('--bank-files', nargs='+', required=True,
+                    help='Split template bank files, one per output.')
+parser.add_argument('--output-files', nargs='+', required=True,
+                    help='Output grid files, in the same order as '
+                         '--bank-files.')
+parser.add_argument('--rows-per-block', type=int, default=2000,
+                    help='Grid rows read at a time (default 2000). Lower '
+                         'it if memory is tight.')
+parser.add_argument('--allow-missing-templates', action='store_true',
+                    help='Do not fail if some bank templates have no grid '
+                         'entry (they would get NaN marg_lnl in the '
+                         'inspiral jobs).')
+args = parser.parse_args()
+pycbc.init_logging(args.verbose)
+
+if len(args.bank_files) != len(args.output_files):
+    parser.error('Need exactly one --output-files entry per --bank-files')
+
+
+def as_uint64(values):
+    """Return template hashes as uint64, however they were stored."""
+    arr = numpy.asarray(values)
+    if arr.dtype == numpy.uint64:
+        return arr
+    if arr.dtype.kind in 'iu':
+        return arr.astype(numpy.int64).view(numpy.uint64)
+    # Python ints (possibly > 2**63 or negative)
+    return numpy.array([int(v) & 0xFFFFFFFFFFFFFFFF for v in arr],
+                       dtype=numpy.uint64)
+
+
+# Map every bank template hash -> index of the output it belongs in.
+# Read hashes through TemplateBank, the same way pycbc_inspiral_tha does.
+logging.info('Reading template hashes from %d bank files',
+             len(args.bank_files))
+hash_to_out = {}
+bank_sizes = []
+for i, bank_path in enumerate(args.bank_files):
+    hashes = as_uint64(TemplateBank(bank_path).table.template_hash)
+    bank_sizes.append(len(hashes))
+    for h in hashes.tolist():
+        if h in hash_to_out:
+            raise ValueError(f'Template hash {h} appears in more than one '
+                             f'bank file ({args.bank_files[hash_to_out[h]]} '
+                             f'and {bank_path})')
+        hash_to_out[h] = i
+logging.info('%d templates across all banks', len(hash_to_out))
+
+with h5py.File(args.grid_file, 'r') as grid:
+    missing = [d for d in ROW_DATASETS if d not in grid]
+    if missing:
+        raise KeyError(f'{args.grid_file} has no dataset(s) {missing}')
+    n_rows = len(grid['template_hash'])
+    for name in ROW_DATASETS:
+        if grid[name].shape[0] != n_rows:
+            raise ValueError(f'{name} has {grid[name].shape[0]} rows but '
+                             f'template_hash has {n_rows}')
+    logging.info('Grid has %d templates', n_rows)
+
+    # Open every output and create empty, growable datasets shaped like
+    # the input's, with every attribute copied over.
+    outs = []
+    for path in args.output_files:
+        f = h5py.File(path, 'w')
+        for key, val in grid.attrs.items():
+            f.attrs[key] = val
+        for name in ROW_DATASETS:
+            src = grid[name]
+            row_shape = src.shape[1:]
+            f.create_dataset(name, shape=(0,) + row_shape,
+                             maxshape=(None,) + row_shape, dtype=src.dtype,
+                             chunks=(min(64, max(1, n_rows)),) + row_shape)
+        outs.append(f)
+
+    written = numpy.zeros(len(outs), dtype=int)
+    n_unused = 0
+    for start in range(0, n_rows, args.rows_per_block):
+        stop = min(start + args.rows_per_block, n_rows)
+        block = {name: grid[name][start:stop] for name in ROW_DATASETS}
+        dest = numpy.array([hash_to_out.get(h, -1) for h in
+                            as_uint64(block['template_hash']).tolist()])
+        n_unused += int(numpy.sum(dest < 0))
+        for i in numpy.unique(dest[dest >= 0]):
+            sel = numpy.nonzero(dest == i)[0]
+            f = outs[i]
+            for name in ROW_DATASETS:
+                ds = f[name]
+                old = ds.shape[0]
+                ds.resize(old + len(sel), axis=0)
+                ds[old:] = block[name][sel]
+            written[i] += len(sel)
+        if (start // args.rows_per_block) % 25 == 0:
+            logging.info('Processed %d / %d grid rows', stop, n_rows)
+
+    for f in outs:
+        f.close()
+
+logging.info('%d grid templates were not in any bank (ignored)', n_unused)
+n_missing = 0
+for i, (bank_path, n_bank) in enumerate(zip(args.bank_files, bank_sizes)):
+    if written[i] != n_bank:
+        n_missing += n_bank - written[i]
+        logging.warning('%s: %d templates, but only %d found in the grid',
+                        bank_path, n_bank, written[i])
+if n_missing and not args.allow_missing_templates:
+    raise RuntimeError(f'{n_missing} bank templates have no grid entry. '
+                       'Use --allow-missing-templates to continue anyway.')
+logging.info('Wrote %d grid files, %d to %d templates each',
+             len(outs), written.min(), written.max())

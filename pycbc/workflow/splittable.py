@@ -31,7 +31,8 @@ https://ldas-jobs.ligo.caltech.edu/~cbc/docs/pycbc/NOTYETCREATED.html
 import os
 import logging
 
-from pycbc.workflow.core import FileList
+from pycbc.workflow.core import Executable, File, FileList, Node
+from pycbc.workflow.core import resolve_url_to_file
 from pycbc.workflow.jobsetup import (PycbcSplitBankExecutable,
         PycbcSplitBankXmlExecutable, PycbcSplitInspinjExecutable,
         PycbcHDFSplitInjExecutable)
@@ -176,5 +177,48 @@ def setup_splittable_dax_generated(workflow, input_tables, out_dir, tags):
         node = curr_exe_job.create_node(input, tags=tags)
         workflow.add_node(node)
         out_file_groups += node.output_files
+        setup_split_marg_grid(workflow, node.output_files, out_dir, tags)
     return out_file_groups
+
+
+def setup_split_marg_grid(workflow, split_banks, out_dir, tags):
+    """Split the THA marginalization grid to match the split banks.
+
+    If [workflow-splittable] (or a tagged subsection) has a
+    marginalized-grid-file option, add one job that reads that grid and
+    writes one small grid file per split bank, containing only that bank's
+    templates. Each split bank File is then given a ``marg_grid_file``
+    attribute pointing at its grid file, which the inspiral jobs pick up
+    (see PyCBCInspiralExecutable.create_node), so each inspiral job only
+    receives its own bank's part of the grid.
+
+    Does nothing if the option is not set.
+    """
+    cp = workflow.cp
+    if not cp.has_option_tags('workflow-splittable',
+                              'marginalized-grid-file', tags):
+        return
+    grid_path = cp.get_opt_tags('workflow-splittable',
+                                'marginalized-grid-file', tags)
+    logger.info("Splitting marginalization grid %s into %d per-bank files",
+                grid_path, len(split_banks))
+    grid_file = resolve_url_to_file(grid_path)
+
+    exe = Executable(cp, 'split_marg_grid', ifos=workflow.ifos,
+                     out_dir=out_dir, tags=tags)
+    node = Node(exe)
+    node.add_input_opt('--grid-file', grid_file)
+    node.add_input_list_opt('--bank-files', split_banks)
+    grid_outs = FileList([])
+    for bank in split_banks:
+        grid_outs.append(File(bank.ifo_list,
+                              bank.description + '_MARG_GRID',
+                              bank.segment, extension='.hdf',
+                              directory=out_dir, tags=bank.tags,
+                              store_file=exe.retain_files))
+    node.add_output_list_opt('--output-files', grid_outs)
+    workflow.add_node(node)
+
+    for bank, grid in zip(split_banks, grid_outs):
+        bank.marg_grid_file = grid
 

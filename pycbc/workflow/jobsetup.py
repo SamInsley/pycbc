@@ -537,6 +537,19 @@ class PyCBCInspiralExecutable(Executable):
         data_seg = segments.segment([int(data_seg[0]), int(data_seg[1])])
         fil.add_metadata('data_seg', data_seg)
         node.add_input_opt('--bank-file', parent)
+        # If the workflow split the marginalization grid to match the split
+        # banks (see splittable.setup_split_marg_grid), give this job only
+        # its own bank's part of the grid.
+        marg_grid = getattr(parent, 'marg_grid_file', None)
+        if marg_grid is not None:
+            if self.has_opt('marginalized-grid-file'):
+                raise ValueError(
+                    "The marginalization grid is being split per bank "
+                    "([workflow-splittable] marginalized-grid-file), so "
+                    "remove marginalized-grid-file from the [%s] section; "
+                    "otherwise every job would also get the full grid."
+                    % self.name)
+            node.add_input_opt('--marginalized-grid-file', marg_grid)
         if df_parents is not None:
             node.add_input_list_opt('--frame-files', df_parents)
 
