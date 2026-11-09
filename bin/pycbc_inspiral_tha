@@ -810,14 +810,14 @@ with ctx:
     # we were inside the scheme context.
 
     # Import system wisdom.
-    if opt.fftw_import_system_wisdom:
+    if getattr(opt, 'fftw_import_system_wisdom', None):
         fft.fftw.import_sys_wisdom()
 
     # Read specified user-provided wisdom files
-    if opt.fftw_input_float_wisdom_file is not None:
+    if getattr(opt, 'fftw_input_float_wisdom_file', None) is not None:
         fft.fftw.import_single_wisdom_from_filename(opt.fftw_input_float_wisdom_file)
 
-    if opt.fftw_input_double_wisdom_file is not None:
+    if getattr(opt, 'fftw_input_double_wisdom_file', None) is not None:
         fft.fftw.import_double_wisdom_from_filename(opt.fftw_input_double_wisdom_file)
 
     flow = opt.low_frequency_cutoff
@@ -1039,10 +1039,10 @@ event_mgr.save_performance(ncores, len(segments), len(bank), run_time, tsetup)
 logging.info("Writing out triggers")
 event_mgr.write_events(opt.output)
 
-if opt.fftw_output_float_wisdom_file:
+if getattr(opt, 'fftw_output_float_wisdom_file', None):
     fft.fftw.export_single_wisdom_to_filename(opt.fftw_output_float_wisdom_file)
 
-if opt.fftw_output_double_wisdom_file:
+if getattr(opt, 'fftw_output_double_wisdom_file', None):
     fft.fftw.export_double_wisdom_to_filename(opt.fftw_output_double_wisdom_file)
 
 logging.info("Finished")
