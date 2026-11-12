@@ -190,33 +190,6 @@ parser.add_argument("--marg-lnl-threshold", type=float, metavar='THRESHOLD',
                          "requires --marginalized-grid-file to be set as "
                          "well for this to have any effect. Default: no "
                          "threshold applied.")
-parser.add_argument("--marg-exclude-hf-cutoff", type=float, default=300.,
-                    metavar='HZ',
-                    help="Frequency (Hz) above which a harmonic's power "
-                         "is checked against "
-                         "--marg-exclude-hf-fraction-threshold, for "
-                         "excluding badly-modelled harmonics from the "
-                         "marg_lnl computation. Only used if "
-                         "--marginalized-grid-file is set. Default: 300.")
-parser.add_argument("--marg-exclude-hf-fraction-threshold", type=float,
-                    default=2., metavar='FRACTION',
-                    help="If a harmonic's ACTUAL orthonormal matched-"
-                         "filter template (not the raw harmonic) has "
-                         "more than this fraction of its PSD-weighted "
-                         "power above --marg-exclude-hf-cutoff Hz, "
-                         "exclude that harmonic entirely from the "
-                         "marg_lnl computation for this template/segment "
-                         "-- its raw harmonic is zeroed before "
-                         "marginalization, which cleanly removes it from "
-                         "every downstream quantity. This targets "
-                         "templates (typically in the transitional-"
-                         "precession regime -- see THA_MARG_INFO.md) "
-                         "whose waveform model concentrates a harmonic's "
-                         "power unphysically close to merger, where it "
-                         "can be spuriously matched by short, high-"
-                         "frequency glitches and inflate marg_lnl. Set "
-                         "above 1.0 to disable this check entirely (a "
-                         "fraction can never exceed 1.0). Default: 0.5.")
 parser.add_argument("--low-frequency-cutoff", type=float,
                   help="The low frequency cutoff to use for filtering (Hz)")
 parser.add_argument("--enable-bank-start-frequency", action='store_true',
@@ -480,12 +453,6 @@ def template_triggers(t_num):
     template = None
     tparam = None
     out_vals_all = []
-    # Cache the high-frequency harmonic exclusion decision ONCE per
-    # template (computed on the first segment encountered), rather than
-    # recomputing it every segment -- see where it's used below for why
-    # this is a reasonable approximation rather than an exact
-    # per-segment recomputation.
-    _hf_exclusion_mask = None
     # Hoisted out of the per-segment loop: this only depends on t_num,
     # not on anything segment-specific, so there is no reason to repeat
     # the dict lookup every segment.
@@ -605,59 +572,6 @@ def template_triggers(t_num):
                     "--sample-rate/--delta-f must exactly match this "
                     "search's configuration; see THA_MARG_INFO.md.".format(
                         len(raws[0]), len(segment_psd)))
-
-            # Exclude any harmonic whose ACTUAL orthonormal matched-filter
-            # template (not the raw harmonic) has too much of its power
-            # concentrated above --marg-exclude-hf-cutoff Hz -- the
-            # signature of a harmonic whose waveform model is poorly
-            # constrained near merger, prone to being spuriously matched
-            # by short, high-frequency glitches rather than tracking
-            # genuine inspiral content. See THA_MARG_INFO.md.
-            #
-            # Computed ONCE per template (cached in _hf_exclusion_mask,
-            # using the FIRST segment's PSD as representative), not
-            # re-derived every segment -- PSD is typically quasi-
-            # stationary across a single analysis run, so this trades a
-            # small amount of per-segment exactness (the real fraction
-            # can drift slightly as the PSD is re-estimated segment to
-            # segment) for avoiding the same 5x5 linear algebra several
-            # times over for every segment of the same template.
-            #
-            # Zeroing raws[k] here (not bank.curr_tmp.h1..h5, so ordinary
-            # matched filtering above is completely unaffected) cleanly
-            # removes that harmonic from every downstream quantity (Graw,
-            # hh, Ep/Ec, M) -- derive_gram_schmidt_transform's existing
-            # near-zero-sigma regularization already handles a
-            # fully-zeroed harmonic correctly (verified: no NaN, no
-            # crash, that harmonic contributes exactly zero thereafter).
-            if opt.marg_exclude_hf_fraction_threshold <= 1.0:
-                if _hf_exclusion_mask is None:
-                    _Graw_hf = tha_marginalize.raw_gram_matrix(
-                        raws, segment_psd, grid['df'], grid['kmin'], grid['kmax'])
-                    _T_hf, _sigma_hf = tha_marginalize.derive_gram_schmidt_transform(_Graw_hf)
-                    _raws_arr_hf = numpy.array(raws)
-                    _e_k_hf = _T_hf @ (_raws_arr_hf / _sigma_hf[:, None])
-
-                    _freqs_hf = numpy.arange(grid['kmax']) * grid['df']
-                    _above_hf = _freqs_hf[grid['kmin']:grid['kmax']] > opt.marg_exclude_hf_cutoff
-                    _hf_exclusion_mask = numpy.zeros(5, dtype=bool)
-                    for _k in range(5):
-                        _weight_hf = (numpy.abs(_e_k_hf[_k, grid['kmin']:grid['kmax']]) ** 2
-                                     / segment_psd[grid['kmin']:grid['kmax']])
-                        _total_hf = numpy.sum(_weight_hf)
-                        _frac_hf = numpy.sum(_weight_hf[_above_hf]) / _total_hf if _total_hf > 0 else 0.
-                        if _frac_hf > opt.marg_exclude_hf_fraction_threshold:
-                            logging.debug(
-                                "Excluding h%d from marg_lnl for template "
-                                "hash=%d (high-freq fraction %.4g > %.4g, "
-                                "decided once from segment %d)", _k + 1,
-                                int(bank.table.template_hash[t_num]), s_num,
-                                _frac_hf, opt.marg_exclude_hf_fraction_threshold)
-                            _hf_exclusion_mask[_k] = True
-
-                for _k in range(5):
-                    if _hf_exclusion_mask[_k]:
-                        raws[_k] = numpy.zeros_like(raws[_k])
 
             marg_z = numpy.array([out_vals['snr_comp_{0}'.format(i + 1)]
                                   for i in range(5)])
