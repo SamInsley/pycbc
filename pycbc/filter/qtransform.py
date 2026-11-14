@@ -106,7 +106,10 @@ def qtiling(fseries, qrange, frange, mismatch=0.2):
     qs = list(_iter_qs(qrange, deltam_f(mismatch)))
     for q in qs:
         qtilefreq = _iter_frequencies(q, frange, mismatch, fseries.duration)
-        qplane_tile_dict[q] = numpy.array(list(qtilefreq))
+        # Remove repeated tile frequencies: rounding to multiples of 1/duration
+        # can give repeats for short data and high Q, which makes the
+        # interpolation in TimeSeries.qtransform fail
+        qplane_tile_dict[q] = numpy.unique(numpy.array(list(qtilefreq)))
 
     return qplane_tile_dict
 

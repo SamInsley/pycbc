@@ -20,3 +20,7 @@ pycbc/waveform/decompress_cpu_cython.cpp
 pycbc/waveform/spa_tmplt_cpu.cpp
 pycbc/waveform/utils_cpu.cpp
 .ipynb_checkpoints/
+
+# Jupyter autosaves
+.ipynb_checkpoints/
+*-checkpoint*
