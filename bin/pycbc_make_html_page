@@ -17,6 +17,7 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 import argparse
+import logging
 import os
 import stat
 import shutil
@@ -63,6 +64,32 @@ def examine_dir(cwd):
 
     return cwd, dirs, nondirs
 
+def is_named_well(name):
+    """ True for well files with a unique name, e.g. well_<tags>.html,
+    as written by sub-workflow jobs that declare their well as an output.
+    """
+    return (name.startswith('well') and name.endswith('.html')
+            and name != 'well.html')
+
+def adopt_named_wells(plots_dir):
+    """
+    The page for a directory is laid out by its 'well.html'. Some jobs
+    write their well under a unique name instead (well_<tags>.html), which
+    would otherwise be ignored and leave the page empty. If a directory has
+    no well.html and exactly one such file, copy it to well.html.
+    """
+    for dirpath, _, filenames in os.walk(plots_dir):
+        if 'well.html' in filenames:
+            continue
+        named = sorted(f for f in filenames if is_named_well(f))
+        if len(named) == 1:
+            shutil.copy2(os.path.join(dirpath, named[0]),
+                         os.path.join(dirpath, 'well.html'))
+        elif len(named) > 1:
+            logging.warning('%s has several well files (%s) and no '
+                            'well.html; none of them will be shown',
+                            dirpath, ', '.join(named))
+
 def render_sitemap_page(output_path, dirs):
     """
     Creates sitemap page.
@@ -95,6 +122,10 @@ class Directory():
             extension = filename.split('.')[-1]
             config_filename = filename.replace(extension, 'file.ini')
             if filename.endswith('file.ini'):
+                continue
+
+            # a uniquely named well is shown through its copy, well.html
+            elif is_named_well(filename) and 'well.html' in filenames:
                 continue
 
             # check if configuration file exists for file
@@ -203,6 +234,9 @@ env.globals.update(get_embedded_config=get_embedded_config)
 env.globals.update(path_exists=os.path.exists)
 env.globals.update(list=list)
 template = env.get_template(input_template)
+
+# use uniquely named well files where a directory has no well.html
+adopt_named_wells(opts.plots_dir)
 
 # find all subdirs and the top-level subdirs
 Directory(opts.plots_dir, opts.plots_dir)
