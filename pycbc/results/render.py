@@ -231,10 +231,23 @@ def render_tmplt(path, cp):
 
     # render template
     template_dir = '/'.join(path.split('/')[:-1])
+
+    # A well file lists the files it shows by the path they had when the well
+    # was written. If it was written somewhere else (e.g. in a job's scratch
+    # directory inside a container) that path is wrong here, but the files
+    # always sit next to the well file, so fall back to looking there.
+    def _resolve(fpath):
+        if os.path.exists(fpath):
+            return fpath
+        local = os.path.join(template_dir, os.path.basename(fpath))
+        return local if os.path.exists(local) else fpath
+
     env = Environment(loader=FileSystemLoader(template_dir))
-    env.globals.update(setup_template_render=setup_template_render)
-    env.globals.update(get_embedded_config=get_embedded_config)
-    env.globals.update(path_exists=os.path.exists)
+    env.globals.update(
+        setup_template_render=lambda p, c: setup_template_render(_resolve(p), c))
+    env.globals.update(
+        get_embedded_config=lambda p: get_embedded_config(_resolve(p)))
+    env.globals.update(path_exists=lambda p: os.path.exists(_resolve(p)))
     template = env.get_template(filename)
     context = {'filename' : filename,
                'slug'     : slug,
