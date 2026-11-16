@@ -2689,7 +2689,7 @@ class PhaseTDMARGStatistic(QuadratureSumStatistic):
                                  for ifo in ifos])
             max_margs = numpy.array([get(ifo, 'marg_snr', numpy.float64)[prec]
                                      for ifo in ifos])
-            rate_p += numpy.min(0.5 * max_margs ** 2 - margs, axis=0)
+            # rate_p += numpy.min(0.5 * max_margs ** 2 - margs, axis=0)
             # Divide by the noise density of (dpsi, dtheta): noise coincs are
             # not uniform in these (both ifos favour the same grid points of
             # the same template), so they are modelled by their own flow and
