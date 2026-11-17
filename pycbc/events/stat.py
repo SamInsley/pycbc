@@ -2494,6 +2494,29 @@ class PhaseTDMARGStatistic(QuadratureSumStatistic):
         beta = numpy.asarray(beta, dtype=numpy.float64)
         return (beta < 1e-6) | (beta > numpy.pi - 1e-6)
 
+    @staticmethod
+    def conditional_columns(names, beta, stats, ifos, mask):
+        """
+        The flow conditioning columns for the coincs in mask, in the order
+        the flow was trained with (see --conditional-params in
+        pycbc_dtphase_tha): 'beta' is one column, 'c' is one column per ifo
+        in the model's ifo order, c = marg_snr^2 / 2 - marg_lnl.
+        """
+        cols = []
+        for p in names:
+            if p == 'beta':
+                cols.append(beta[mask])
+            elif p == 'c':
+                for ifo in ifos:
+                    ms = numpy.array(stats[ifo]['marg_snr'],
+                                     dtype=numpy.float64, ndmin=1)
+                    ml = numpy.array(stats[ifo]['marg_lnl'],
+                                     dtype=numpy.float64, ndmin=1)
+                    cols.append((0.5 * ms ** 2 - ml)[mask])
+            else:
+                raise ValueError('Unknown flow conditional %s' % p)
+        return numpy.column_stack(cols).astype(numpy.float32)
+
     def get_hist(self, ifos=None, num_comps=None):
         """
         Read in the signal density models for the ifo combination
@@ -2547,6 +2570,12 @@ class PhaseTDMARGStatistic(QuadratureSumStatistic):
         # Noise density of (dpsi, dtheta) per ifo pair, conditioned on beta
         self.model_noise = MLStatistic.from_file(self.files[selected_noise],
                                                  group_name="model")
+        # What each flow is conditioned on (saved by pycbc_dtphase_tha*);
+        # older files were conditioned on beta
+        self.cond_prec = list(self.model.metadata.get('conditional',
+                                                      ['beta']))
+        self.cond_noise = list(self.model_noise.metadata.get('conditional',
+                                                             ['beta']))
         self.model_ifos = self.model.metadata.get("ifos")
         self.model_relfac = self.model.metadata.get("relfac")
         # Maximum flow log density over the training samples (log units)
@@ -2680,7 +2709,8 @@ class PhaseTDMARGStatistic(QuadratureSumStatistic):
             xp = x[prec]
             rate_p = self._log_prob_chunked(
                 self.model, xp,
-                conditional=beta[prec][:, None].astype(numpy.float32))
+                conditional=self.conditional_columns(self.cond_prec, beta,
+                                                     stats, ifos, prec))
             # Jacobian from log SNR ratio to SNR ratio
             rate_p -= xp[:, 2::6].sum(axis=1)
             # Correct for each ifo having been marginalized over the
@@ -2700,7 +2730,8 @@ class PhaseTDMARGStatistic(QuadratureSumStatistic):
                           for c in (6 * i + 4, 6 * i + 5)]
             rate_p -= self._log_prob_chunked(
                 self.model_noise, xp[:, noise_cols],
-                conditional=beta[prec][:, None].astype(numpy.float32))
+                conditional=self.conditional_columns(self.cond_noise, beta,
+                                                     stats, ifos, prec))
             rate[prec] = rate_p
 
         # Aligned-spin templates: time, phase and SNR ratio only. All grid

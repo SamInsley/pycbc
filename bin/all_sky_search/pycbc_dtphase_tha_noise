@@ -15,6 +15,11 @@ files, the same marginalization, jitter and psi fold) except that:
   and the log SNR ratio is not orientation-dependent, so they are left out;
   dpsi and dtheta are not uniform for noise (both detectors favour the same
   grid points of the same template) and are what this model describes.
+* the model is conditioned on --conditional-params (default: c of each
+  detector, c = max grid lnl - marg_lnl = marg_snr^2/2 - marg_lnl, which is 0
+  for a flat grid and ln N for a single-point peak). How far apart the two
+  best grid points land depends on how flat each detector's grid is, which
+  beta alone does not capture.
 
 Pure Gaussian noise rarely reaches sqrt(2 marg_lnl) >= 4, so --snr-threshold
 defaults to 0 here (keep all draws); raising it keeps only the loud tail and
@@ -129,6 +134,15 @@ parser.add_argument("--samples-per-template", type=int, default=1000,
 parser.add_argument("--snr-threshold", type=float, default=0.,
                     help="Keep only noise draws with sqrt(2 marg_lnl) above "
                          "this in every ifo. Default: 0 (keep all).")
+parser.add_argument("--conditional-params", nargs='+', default=['c'],
+                    choices=['c', 'beta'],
+                    help="What the flow is conditioned on, in this order. "
+                         "'c': one column per ifo (in --ifos order), "
+                         "c = max grid lnl - marg_lnl, how peaked that ifo's "
+                         "likelihood is over the orientation grid. 'beta': "
+                         "the template opening angle. The list is saved in "
+                         "the model's metadata so the statistic builds the "
+                         "same columns. Default: c.")
 parser.add_argument("--loss-plot", type=str, default=None,
                     help="File to save the training/validation loss vs "
                          "epoch plot to. Default: the output file name with "
@@ -241,23 +255,43 @@ def load_template(h):
 
 
 def marginalize(z, Mf, hh, ln_w):
-    """marg_lnl, best grid index and dh at that index, as in
+    """marg_lnl, best grid index, dh at that index and
+    c = max lnl - marg_lnl (how peaked the grid is), as in
     tha_marginalize.marginalize_segment(method='max', return_argmax=True).
     Done in chunks of --batch-size samples to limit memory."""
     n = len(z)
     marg_lnl = np.empty(n)
     best = np.empty(n, dtype=int)
     best_dh = np.empty(n, dtype=complex)
+    peak = np.empty(n)
     for s in range(0, n, args.batch_size):
         sl = slice(s, s + args.batch_size)
         dh = z[sl] @ Mf.T
         lnl = np.abs(dh) ** 2 / (2. * hh)
         marg_lnl[sl] = logsumexp(ln_w + lnl, axis=1)
         lmax = lnl.max(axis=1, keepdims=True)
+        peak[sl] = lmax[:, 0] - marg_lnl[sl]
         b = np.argmax(lnl >= lmax * (1. - 1e-10), axis=1)
         best[sl] = b
         best_dh[sl] = dh[np.arange(len(b)), b]
-    return marg_lnl, best, best_dh
+    return marg_lnl, best, best_dh, peak
+
+
+def conditional_columns(data, beta, keep):
+    """The conditioning columns, in --conditional-params order. Must match
+    PhaseTDMARGStatistic.conditional_columns."""
+    cols = []
+    for p in args.conditional_params:
+        if p == 'beta':
+            cols.append(np.full(keep.sum(), beta))
+        elif p == 'c':
+            cols += [data[ifo]['c'][keep] for ifo in args.ifos]
+    return np.column_stack(cols)
+
+
+cond_names = []
+for p in args.conditional_params:
+    cond_names += ['beta'] if p == 'beta' else ['c_' + ifo for ifo in args.ifos]
 
 
 logging.info('Generating noise samples to train a normalizing flow')
@@ -289,10 +323,11 @@ while nkept < args.nf_samples:
         # pure noise: one complex unit-variance draw per harmonic,
         # independent in every detector
         z = rng.standard_normal((size, 5)) + 1j * rng.standard_normal((size, 5))
-        marg_lnl, best, best_dh = marginalize(z, Mf, hh, ln_w)
+        marg_lnl, best, best_dh, peak = marginalize(z, Mf, hh, ln_w)
 
         data[ifo] = {}
         data[ifo]['snr'] = np.sqrt(2. * np.maximum(marg_lnl, 1e-30))
+        data[ifo]['c'] = peak
         # Dequantize the best-fit grid point, as in the statistic
         costheta = (np.cos(grid_theta[best])
                     + rng.uniform(-.5, .5, size=size) * dcostheta)
@@ -319,7 +354,7 @@ while nkept < args.nf_samples:
         continue
 
     xs.append(np.column_stack(bind)[keep])
-    conds.append(np.full((keep.sum(), 1), template['beta']))
+    conds.append(conditional_columns(data, template['beta'], keep))
     nkept += keep.sum()
     logging.info('Kept %d samples (total %d)', keep.sum(), nkept)
 
@@ -327,6 +362,12 @@ while nkept < args.nf_samples:
 logging.info('Finished sampling. Starting NF training...')
 x = np.concatenate(xs)
 cond = np.concatenate(conds)
+# Coverage of the conditioning values: the statistic is only trustworthy for
+# coincs inside this range, so compare with the c of real triggers
+for j, name in enumerate(cond_names):
+    q = np.percentile(cond[:, j], [0, 1, 50, 99, 100])
+    logging.info('conditional %s: min %.3g, 1%% %.3g, median %.3g, '
+                 '99%% %.3g, max %.3g', name, *q)
 n_dims = x.shape[1]
 n_per_pair = 2
 
@@ -342,7 +383,7 @@ bounds = np.array(bounds, dtype=np.float32)
 
 # Training the Normalizing Flow. Increasing the training parameters should
 # improve performance at the expense of some increased cost.
-flow = NormalizingFlow(n_dims, bounds=bounds, context_dims=1,
+flow = NormalizingFlow(n_dims, bounds=bounds, context_dims=cond.shape[1],
                        n_neurons=args.nf_neurons, num_bins=args.nf_bins)
 history = flow.fit(x, conditional=cond, n_samples=args.nf_samples)
 hist_max = float(np.max(flow.log_prob(x, conditional=cond)))
@@ -364,6 +405,8 @@ ml_stat = MLStatistic(
         "dcostheta": dcostheta,
         "dalpha": dalpha,
         "dpsi": d_psi,
+        "conditional": list(args.conditional_params),
+        "conditional_columns": cond_names,
     }
 )
 ml_stat.to_file(args.output_file, group_name="model")
