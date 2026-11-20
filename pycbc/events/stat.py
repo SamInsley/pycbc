@@ -2728,10 +2728,16 @@ class PhaseTDMARGStatistic(QuadratureSumStatistic):
             # [dpsi, dtheta] order.
             noise_cols = [c for i in range(len(other_ifos))
                           for c in (6 * i + 4, 6 * i + 5)]
-            rate_p -= self._log_prob_chunked(
-                self.model_noise, xp[:, noise_cols],
-                conditional=self.conditional_columns(self.cond_noise, beta,
-                                                     stats, ifos, prec))
+            if getattr(self, 'uniform_noise', False):
+                # uniform over the noise flow's bounds: density 1/pi^2 per
+                # ifo pair
+                rate_p += 2. * numpy.log(numpy.pi) * len(other_ifos)
+            else:
+                rate_p -= self._log_prob_chunked(
+                    self.model_noise, xp[:, noise_cols],
+                    conditional=self.conditional_columns(self.cond_noise,
+                                                         beta, stats, ifos,
+                                                         prec))
             rate[prec] = rate_p
 
         # Aligned-spin templates: time, phase and SNR ratio only. All grid
@@ -3219,6 +3225,12 @@ class ExpFitFgBgNormMARGStatistic(PhaseTDMARGStatistic,
         # FIXME: Currently hardcoded to True. This statistic does not support the
         #        statistic features options at present. Do *NOT* give them!!
         kwargs['normalize_fit_rate'] = True
+        # uniform_noise:1 replaces the (dpsi, dtheta) noise flow by a uniform
+        # density over its bounds, dpsi in [-pi/4, pi/4), dtheta in
+        # [-pi, pi): 1 / pi^2 per ifo pair (a test of how much the noise
+        # model matters)
+        self.uniform_noise = str(kwargs.pop('uniform_noise', '0')).lower() \
+            in ('1', 'true', 'yes', '1.0')
 
         # read in background fit info and store it
         ExpFitStatistic.__init__(self, sngl_ranking, files=files,
@@ -3524,6 +3536,11 @@ class ExpFitFgBgNormMARGStatistic(PhaseTDMARGStatistic,
         # model this template uses, times the SNR^-4 population factor
         logr_s = (numpy.where(aligned, self.hist_max_aligned, self.hist_max)
                   - 4. * numpy.log(kwargs['min_snr'] / self.ref_snr))
+        if getattr(self, 'uniform_noise', False):
+            # the uniform (dpsi, dtheta) noise density adds 2 ln(pi) per pair
+            logr_s = logr_s + numpy.where(
+                aligned, 0., 2. * numpy.log(numpy.pi)
+                * (len(self.hist_ifos) - 1))
 
         # Find total volume of phase-time-amplitude space occupied by noise
         # coincs, as in rank_stat_coinc
@@ -3547,6 +3564,1516 @@ class ExpFitFgBgNormMARGStatistic(PhaseTDMARGStatistic,
 
     
     
+class _LazyPSD(object):
+    """A PSD segment read only if its values are needed (the responses
+    usually need just its cached band means)"""
+    def __init__(self, owner, ifo, i):
+        self.owner, self.key = owner, (ifo, i)
+        self._a = None
+
+    def array(self):
+        if self._a is None:
+            self._a = self.owner._psd(*self.key)
+        return self._a
+
+    def __getitem__(self, k):
+        return self.array()[k]
+
+
+class ExactCoincTerm(object):
+    """
+    Exact coincident term for a precessing H1-L1 coinc, from the triggers'
+    stored harmonic SNRs (see ExpFitFgBgNormMARGExactStatistic).
+
+        exact = ln < e^{lnL_H} e^{lnL_L} p(SNR ratio, dphase | source, S)
+                     p(dt | sky, S) >_{orientation, sky ring, polarisation}
+                - lambda_H - lambda_L + ln(twin 2 pi)
+
+    lnL_d is the single-detector log likelihood maximised over the complex
+    amplitude, for the waveform the source puts in detector d (grid A, B,
+    the template's raw harmonics and the detector's PSD, rebuilt as in
+    pycbc_inspiral_tha). The amplitude/phase density is a Gaussian in the
+    difference between the two detectors' best-fit complex amplitudes
+    (normalised in SNR ratio and phase difference, with a fractional
+    systematic floor); the time density a Gaussian in dt - tau(sky) (with a
+    floor for the trigger time's sample rounding). Only the ring of sky
+    positions whose H1-L1 delay matches dt is used; the single-detector
+    marginals lambda_d are over the same points (for one detector the sky
+    position only enters through the effective polarisation, which is
+    uniform for every sky point, so this equals the all-sky value).
+    """
+
+    def __init__(self, ifos, grid_file, bank_file, psd_files, n_fine=262144,
+                 max_ring=1000, n_pol=8, prune=10., amp_phase_floor=0.,
+                 timing_floor=None, timing_uncertainty=0.001,
+                 snr_reference=5., psi_gp=16, cache_size=64,
+                 quiet_snr=12., quiet_ring=32, quiet_pol=4, quiet_ang=16,
+                 check_frac=0., batch_elems=4e6, seed=0,
+                 quiet_orient_step=4, method='grid', q_tau=6, q_az=8,
+                 q_pol=4, l_tau=12, l_az=24, l_pol=6, r_tau=24, r_az=48,
+                 r_pol=12, check_ref='reference', psd_mode='segment',
+                 bound_margin=2., refine_above=4., gram_bins=8192,
+                 phase_time=1, phase_time_sign=-1., phase_time_freq=0.):
+        self.ifos = list(ifos)
+        if len(self.ifos) != 2:
+            raise ValueError('The exact coincident term is for two ifos')
+        self.grid_file = grid_file
+        self.bank_file = bank_file
+        self.psd_files = psd_files
+        self.n_fine = int(n_fine)
+        self.max_ring = int(max_ring)
+        self.n_pol = int(n_pol)
+        self.prune = float(prune)
+        self.eps2 = float(amp_phase_floor) ** 2
+        self.timing_floor = timing_floor
+        self.timing_uncertainty = float(timing_uncertainty)
+        self.snr_reference = float(snr_reference)
+        self.psi_gp = int(psi_gp)
+        self.cache_size = int(cache_size)
+        # quiet coincs (network SNR below quiet_snr, almost all background):
+        # their likelihood varies slowly over sky and polarisation, so they
+        # are done in batches with quiet_ring sky points x quiet_pol
+        # polarisations; a fraction check_frac of them is also done at full
+        # resolution, and the difference is kept in self.check_diffs
+        self.quiet_snr = float(quiet_snr)
+        self.quiet_ring = int(quiet_ring)
+        self.quiet_pol = int(quiet_pol)
+        self.quiet_ang = int(quiet_ang)
+        # quiet coincs: the joint sum uses every quiet_orient_step-th
+        # orientation (staggered in alpha from one theta row to the next),
+        # each standing for quiet_orient_step of them
+        self.quiet_orient_step = int(quiet_orient_step)
+        self.check_frac = float(check_frac)
+        self.batch_elems = float(batch_elems)
+        self.check_rng = numpy.random.default_rng(int(seed))
+        self.check_diffs = []
+        self.check_full = []
+        self.check_kind = []
+        # 'grid': sky integral by quadrature over the H1-L1 baseline
+        # coordinates (Gauss-Legendre in the delay, evenly spaced in the
+        # azimuth around the baseline), with (q_tau, q_az, q_pol) nodes for
+        # quiet coincs and (l_tau, l_az, l_pol) for loud ones;
+        # 'reference': every coinc at (r_tau, r_az, r_pol) with every
+        # orientation (slow; the yardstick for the others);
+        # 'ring': the earlier random-ring version (_batch / _one)
+        self.method = str(method)
+        self.q_nodes = (int(q_tau), int(q_az), int(q_pol))
+        self.l_nodes = (int(l_tau), int(l_az), int(l_pol))
+        self.r_nodes = (int(r_tau), int(r_az), int(r_pol))
+        # what the spot checks compare with: 'reference' or 'ring'
+        self.check_ref = str(check_ref)
+        # 'segment': responses for each trigger's own PSD segment;
+        # 'reference': one PSD per ifo (the median over the job's segments)
+        # for every trigger, so one response set per template and ifo
+        self.psd_mode = str(psd_mode)
+        self.bound_margin = float(bound_margin)
+        # quiet coincs whose statistic comes out above refine_above are
+        # recomputed with the loud settings (they are the rare ones that
+        # matter: every decimation threshold is above it by default)
+        self.refine_above = float(refine_above)
+        self.gram_bins = int(gram_bins)
+        # Time-phase coupling: noise moves each ifo's SNR peak by dt_d and
+        # rotates its phase by 2 pi fbar dt_d. At a sky position with delay
+        # tau the shifts' difference is dt - tau, so L1's phase is rotated
+        # back by -sign 2 pi fbar (dt - tau) before the ifos are compared.
+        # fbar: the template's mean frequency, weighted by |h|^2 / PSD (or
+        # phase_time_freq if > 0). sign: measured on injections (-1).
+        self.phase_time = bool(float(phase_time))
+        self.phase_time_sign = float(phase_time_sign)
+        self.phase_time_freq = float(phase_time_freq)
+        self.n_refined = 0
+        self.t_raws = 0.
+        self.t_resp = 0.
+        self._gl = {}
+        self.n_quiet = 0
+        self.n_loud = 0
+        self.loaded = False
+        self.t_setup = 0.
+        self.t_coinc = 0.
+
+    def load(self):
+        import pycbc.detector
+        from pycbc.waveform.bank import TemplateBank
+        self.gf = h5py.File(self.grid_file, 'r')
+        ga = self.gf.attrs
+        self.df = float(ga['df'])
+        self.kmin, self.kmax = int(ga['kmin']), int(ga['kmax'])
+        self.sample_rate = float(ga['sample_rate'])
+        self.f_lower = float(ga['low_frequency_cutoff'])
+        self.f_final = self.sample_rate / 2.
+        self.nfreq = int(self.f_final / self.df) + 1
+        self.theta_grid = numpy.asarray(ga['theta_grid'])
+        self.alpha_grid = numpy.asarray(ga['alpha_grid'])
+        w = numpy.asarray(ga['weights_ta'], dtype=float)
+        self.weights_ta = w
+        self.ln_wta = numpy.log(w / w.sum())
+        self.grid_row = {int(h): i for i, h in
+                         enumerate(self.gf['template_hash'][:])}
+        self.bank = TemplateBank(self.bank_file)
+        if self.timing_floor is None:
+            self.timing_floor = 1. / (self.sample_rate * numpy.sqrt(12.))
+        self.timing_floor = float(self.timing_floor)
+
+        self.psd_h = {}
+        self.psd_times = {}
+        for ifo in self.ifos:
+            f = h5py.File(self.psd_files[ifo], 'r')
+            self.psd_h[ifo] = f
+            self.psd_times[ifo] = (f[ifo]['start_time'][:],
+                                   f[ifo]['end_time'][:])
+
+        # Sky positions in Earth-fixed coordinates (longitude, latitude) and
+        # their H1-L1 delays, which do not depend on time in this frame
+        self.dets = {ifo: pycbc.detector.Detector(ifo) for ifo in self.ifos}
+        k = numpy.arange(self.n_fine)
+        self.lon = (k * numpy.pi * (3. - numpy.sqrt(5.))) % (2. * numpy.pi)
+        self.lat = numpy.arcsin(1. - (2. * k + 1.) / self.n_fine)
+        t0 = 1e9
+        ra0 = self.lon + self._gmst(t0)
+        h, l = self.ifos
+        self.tau = numpy.asarray(
+            self.dets[h].time_delay_from_earth_center(ra0, self.lat, t0)
+            - self.dets[l].time_delay_from_earth_center(ra0, self.lat, t0))
+        # psi and psi + pi/2 differ by a sign in both detectors, absorbed by
+        # the common phase: [0, pi/2) covers every case
+        self.pols = (numpy.arange(self.n_pol) + 0.5) * (numpy.pi / 2) \
+            / self.n_pol
+        # antenna patterns are fixed in the Earth frame too: F(psi) =
+        # F(0) cos 2psi + F(pi/4) sin 2psi for both F+ and Fx
+        self.F = {}
+        for ifo in self.ifos:
+            p0, c0 = self.dets[ifo].antenna_pattern(ra0, self.lat, 0., t0)
+            p4, c4 = self.dets[ifo].antenna_pattern(ra0, self.lat,
+                                                    numpy.pi / 4, t0)
+            self.F[ifo] = tuple(numpy.asarray(v, dtype=numpy.float32)
+                                for v in (p0, p4, c0, c4))
+        self.tau_order = numpy.argsort(self.tau)
+        self.tau_sorted = self.tau[self.tau_order]
+        if self.psd_mode == 'reference':
+            self._make_reference_psds()
+        if self.method in ('grid', 'reference'):
+            n_e = numpy.stack([numpy.cos(self.lat) * numpy.cos(self.lon),
+                               numpy.cos(self.lat) * numpy.sin(self.lon),
+                               numpy.sin(self.lat)], axis=1)
+            self._setup_geometry(n_e, {ifo: numpy.asarray(
+                self.dets[ifo].response, dtype=numpy.float64)
+                for ifo in self.ifos})
+        # antenna-vector angle for the single-ifo marginals (F and -F are
+        # the same up to the fitted phase, so [0, pi) covers it)
+        self.ang = (numpy.arange(64) + 0.5) * numpy.pi / 64
+        self.tmpl_cache = {}
+        self.resp_cache = {}
+        self.loaded = True
+        logger.info('Exact coincident term: grid %s (%d orientations), '
+                    'bank %s, PSDs %s', self.grid_file, len(self.theta_grid),
+                    self.bank_file, self.psd_files)
+
+    @staticmethod
+    def _gmst(t):
+        import lal
+        return float(lal.GreenwichMeanSiderealTime(lal.LIGOTimeGPS(float(t))))
+
+    def _psd_index(self, ifo, t):
+        st, et = self.psd_times[ifo]
+        inside = numpy.nonzero((st <= t) & (t < et))[0]
+        if len(inside) == 0:
+            return None
+        if self.psd_mode == 'reference':
+            return 0
+        return int(inside[numpy.argmin(numpy.abs(
+            0.5 * (st[inside] + et[inside]) - t))])
+
+    def _make_reference_psds(self):
+        """One PSD per ifo: 1 / (mean over the job's PSD segments of
+        1/PSD), built while reading so that only one segment is held at a
+        time"""
+        self.ref_psd = {}
+        for ifo in self.ifos:
+            n = len(self.psd_times[ifo][0])
+            acc, cnt = None, None
+            for i in range(n):
+                p = self._psd_read(ifo, i)
+                w = numpy.where(p > 0, 1. / numpy.where(p > 0, p, 1.), 0.)
+                acc = w if acc is None else acc + w
+                cnt = (p > 0).astype(float) if cnt is None \
+                    else cnt + (p > 0)
+            mw = numpy.where(cnt > 0, acc / numpy.maximum(cnt, 1), 0.)
+            self.ref_psd[ifo] = numpy.where(mw > 0, 1. / numpy.where(
+                mw > 0, mw, 1.), 0.)
+        logger.info('Exact coincident term: one reference PSD per ifo '
+                    '(average of 1/PSD over %s segments)',
+                    {i: len(self.psd_times[i][0]) for i in self.ifos})
+
+    def _psd(self, ifo, i):
+        if self.psd_mode == 'reference' or i == 'ref':
+            if not hasattr(self, 'ref_psd'):
+                self._make_reference_psds()
+            return self.ref_psd[ifo]
+        return self._psd_segment(ifo, i)
+
+    def _psd_segment(self, ifo, i):
+        # full PSDs are not kept (hundreds of segments x ~10^6 bins); the
+        # responses keep each segment's band means instead (see _gram)
+        return self._psd_read(ifo, i)
+
+    def _psd_read(self, ifo, i):
+        import pycbc.psd
+        from pycbc.types import FrequencySeries
+        d = self.psd_h[ifo][ifo]['psds'][str(i)]
+        fs = FrequencySeries(d[:].astype(numpy.float64),
+                             delta_f=float(d.attrs['delta_f']))
+        fs = pycbc.psd.interpolate(fs, self.df)
+        arr = numpy.zeros(self.nfreq)
+        n = min(self.nfreq, len(fs))
+        arr[:n] = fs.numpy()[:n]
+        return arr
+
+    def _template(self, tid):
+        if tid not in self.tmpl_cache:
+            import time as _time
+            from pycbc.waveform.bank import PhenomXPTemplate
+            from pycbc.waveform.tha_marg_grid import get_raw_harmonics
+            t0 = _time.time()
+            if len(self.tmpl_cache) >= self.cache_size:
+                self.tmpl_cache.clear()
+            row = self.grid_row.get(int(self.bank.table.template_hash[tid]))
+            if row is None:
+                self.tmpl_cache[tid] = None
+            else:
+                tmpl = PhenomXPTemplate(self.bank.table[tid], self.sample_rate,
+                                        self.f_lower)
+                b = float(tmpl.beta)
+                aligned = bool((b < 1e-6) or (b > numpy.pi - 1e-6))
+                A, B = self.gf['A'][row], self.gf['B'][row]
+                w = self.ln_wta
+                if aligned:
+                    # alpha0 does nothing for aligned spins: keep one alpha0
+                    # per theta, carrying the weight of all of them
+                    th = numpy.round(self.theta_grid, 12)
+                    _, first = numpy.unique(th, return_index=True)
+                    first = numpy.sort(first)
+                    w = numpy.array([numpy.logaddexp.reduce(
+                        self.ln_wta[th == th[i]]) for i in first])
+                    A, B = A[first], B[first]
+                self.tmpl_cache[tid] = dict(
+                    aligned=aligned, A=A, B=B, ln_w=w,
+                    raws=get_raw_harmonics(tmpl, self.df, self.f_final,
+                                           self.kmin, self.kmax, interp=True))
+            self.t_setup += _time.time() - t0
+            self.t_raws += _time.time() - t0
+        return self.tmpl_cache[tid]
+
+    def _responses(self, tid, ifo, ipsd):
+        if self.psd_mode == 'reference':
+            ipsd = 'ref'
+        key = (tid, ifo, ipsd)
+        if key not in self.resp_cache:
+            import time as _time
+            from pycbc.filter.tha_marginalize import derive_ep_ec_hh
+            T = self._template(tid)
+            t0 = _time.time()
+            # keep responses across templates (coincs of several templates
+            # may alternate), dropping the oldest once there are many
+            if len(self.resp_cache) >= 4000:
+                for k_ in list(self.resp_cache)[:1000]:
+                    del self.resp_cache[k_]
+            psd = _LazyPSD(self, ifo, ipsd)
+            if T['aligned']:
+                Ep, Ec, hpp, hcc, hpc = self._aligned_ep_ec(T, psd)
+            else:
+                Ep, Ec, hpp, hcc, hpc = self._precessing_ep_ec(T, psd)
+            # Scale the responses to order unity: the likelihood, the
+            # amplitude/phase density and the time density are all unchanged
+            # by a COMMON scale (X -> sX, sigma^2 -> s^2 sigma^2), and the
+            # joint sum is done in single precision, where the raw values
+            # (strain units) would underflow. The scale must be the same for
+            # every ifo and PSD segment of the template: a separate scale per
+            # ifo would divide out the ifos' relative sensitivity and shift
+            # every predicted amplitude ratio.
+            hpp, hcc, hpc = numpy.real(hpp), numpy.real(hcc), numpy.real(hpc)
+            if not hasattr(self, '_tscale'):
+                self._tscale = {}
+            if tid not in self._tscale:
+                self._tscale[tid] = 1. / numpy.sqrt(numpy.median(hpp + hcc))
+            scale = self._tscale[tid]
+            fbar = numpy.nan
+            wkey = (ifo, 'ref' if self.psd_mode == 'reference' else ipsd)
+            if 'Pf' in T and wkey in getattr(self, '_wb', {}):
+                wb = self._wb[wkey]
+                fbar = float(numpy.dot(T['Pf'], wb)
+                             / numpy.dot(numpy.real(T['Pb'][0, 0]), wb))
+            self.resp_cache[key] = dict(
+                Ep=numpy.conj(numpy.asarray(Ep)) * scale,
+                Ec=numpy.conj(numpy.asarray(Ec)) * scale,
+                hpp=hpp * scale ** 2, hcc=hcc * scale ** 2,
+                hpc=hpc * scale ** 2, fbar=fbar)
+            self.t_setup += _time.time() - t0
+            self.t_resp += _time.time() - t0
+        return self.resp_cache[key]
+
+    def _gram(self, T, psd, nh=None):
+        """
+        Inner products of the template's harmonics, <raw_k|raw_l> =
+        4 df sum conj(raw_k) raw_l / psd over [kmin, kmax).
+
+        The products conj(raw_k) raw_l change slowly with frequency (the
+        chirp phase cancels between harmonics) and so does 1/psd away from
+        narrow lines, so each template's products are summed once into
+        gram_bins frequency bands, and each PSD needs only its mean 1/psd
+        per band: a few thousand operations per PSD segment instead of
+        millions. Checked against the exact sum (and raw_gram_matrix) on
+        the first template; if the banded sum is off by more than 1e-4 the
+        exact sum is used throughout.
+        """
+        from pycbc.filter.tha_marginalize import raw_gram_matrix
+        np = numpy
+        k0, k1 = self.kmin, self.kmax
+        nb = int(getattr(self, 'gram_bins', 8192))
+        if not hasattr(self, '_wb'):
+            self._wb = {}
+        key = getattr(psd, 'key', None)
+
+        def band_means(edges):
+            if key is not None and key in self._wb:
+                return self._wb[key]
+            p_ = np.asarray(psd[k0:k1], dtype=np.float64)
+            w_ = np.where(p_ > 0, 1. / np.where(p_ > 0, p_, 1.), 0.)
+            wb_ = np.add.reduceat(w_, edges[:-1]) / np.diff(edges)
+            if key is not None:
+                self._wb[key] = wb_
+            return wb_
+
+        if 'Pb' in T and getattr(self, 'banded_gram', None):
+            # band sums already made; the harmonics themselves are freed
+            G = 4. * self.df * (T['Pb'] @ band_means(T['edges']))
+            return G.T if self.gram_transpose else G
+        p = np.asarray(psd[k0:k1], dtype=np.float64)
+        w = np.where(p > 0, 1. / np.where(p > 0, p, 1.), 0.)
+        if 'R' not in T:
+            raws = T['raws'] if nh is None else T['raws'][:nh]
+            T['R'] = np.array([np.asarray(r[k0:k1]) for r in raws],
+                              dtype=np.complex128)
+        R = T['R']
+        nk = R.shape[1]
+        use_bins = getattr(self, 'banded_gram', None) is not False and \
+            nk > 4 * nb
+        if use_bins:
+            edges = np.linspace(0, nk, nb + 1).astype(int)
+            T['edges'] = edges
+            if 'Pb' not in T:
+                nh = len(R)
+                Pb = np.zeros((nh, nh, nb), dtype=np.complex128)
+                Rc = np.conj(R)
+                for a_ in range(nh):
+                    for b_ in range(a_, nh):
+                        Pb[a_, b_] = np.add.reduceat(Rc[a_] * R[b_],
+                                                     edges[:-1])
+                        if b_ != a_:
+                            Pb[b_, a_] = np.conj(Pb[a_, b_])
+                T['Pb'] = Pb
+                fr = (k0 + np.arange(nk)) * self.df
+                T['Pf'] = np.add.reduceat(fr * np.abs(R[0]) ** 2,
+                                          edges[:-1])
+            wb = np.add.reduceat(w, edges[:-1]) / np.diff(edges)
+            if key is not None:
+                self._wb[key] = wb
+            G = 4. * self.df * (T['Pb'] @ wb)
+        if getattr(self, 'banded_gram', None) is None and nh is None:
+            Gx = 4. * self.df * (np.conj(R) * w) @ R.T
+            G0 = np.asarray(raw_gram_matrix(T['raws'], psd.array()
+                                            if hasattr(psd, 'array') else psd,
+                                            self.df, self.kmin, self.kmax))
+            sc = np.abs(np.diag(G0)).max()
+            tr = np.abs(Gx.T - G0).max() < np.abs(Gx - G0).max()
+            self.gram_transpose = bool(tr)
+            ex_err = np.abs((Gx.T if tr else Gx) - G0).max() / sc
+            if use_bins:
+                b_err = np.abs((G.T if tr else G) - G0).max() / sc
+                self.banded_gram = bool(b_err < 1e-4 and ex_err < 1e-8)
+            else:
+                b_err = np.nan
+                self.banded_gram = False
+            self.exact_gram_ok = bool(ex_err < 1e-8)
+            logger.info('Exact term: harmonic inner products (%d frequency '
+                        'bins): exact matrix product vs raw_gram_matrix %.1e,'
+                        ' %d-band sum vs raw_gram_matrix %.1e -> using %s',
+                        nk, ex_err, nb, b_err,
+                        'the band sums' if self.banded_gram else
+                        ('the exact matrix product' if self.exact_gram_ok
+                         else 'raw_gram_matrix'))
+            if not self.banded_gram:
+                return Gx.T if tr and self.exact_gram_ok else (
+                    Gx if self.exact_gram_ok else G0)
+        if getattr(self, 'banded_gram', None) and use_bins:
+            # free the harmonics: only the band sums are needed from now on
+            T.pop('R', None)
+            T['raws'] = None
+            return G.T if self.gram_transpose else G
+        if getattr(self, 'banded_gram', None) is None:
+            # not yet checked (an aligned template came first): exact sum
+            Gx = 4. * self.df * (np.conj(R) * w) @ R.T
+            return Gx
+        if not getattr(self, 'exact_gram_ok', True):
+            return raw_gram_matrix(T['raws'], psd.array() if hasattr(
+                psd, 'array') else psd, self.df, self.kmin, self.kmax)
+        Gx = 4. * self.df * (np.conj(R) * w) @ R.T
+        return Gx.T if self.gram_transpose else Gx
+
+    def _precessing_ep_ec(self, T, psd):
+        """
+        Responses of every grid orientation, as in
+        tha_marginalize.derive_ep_ec_hh (same algebra, with the harmonic
+        inner products from _gram).
+        """
+        from pycbc.filter.tha_marginalize import derive_gram_schmidt_transform
+        np = numpy
+        A, B = np.asarray(T['A']), np.asarray(T['B'])
+        Graw = self._gram(T, psd)
+        Tm, sigma = derive_gram_schmidt_transform(Graw)
+        Gn = Graw / np.outer(sigma, sigma)
+        M = (Tm.conj() @ Gn) * sigma[None, :]
+        Ep = A @ M.T
+        Ec = B @ M.T
+        hh_pp = np.einsum('ij,jk,ik->i', A.conj(), Graw, A).real
+        hh_cc = np.einsum('ij,jk,ik->i', B.conj(), Graw, B).real
+        hh_pc = np.einsum('ij,jk,ik->i', A.conj(), Graw, B)
+        return Ep, Ec, hh_pp, hh_cc, hh_pc
+
+    def _aligned_ep_ec(self, T, psd):
+        """
+        Aligned-spin templates have one harmonic, so the stored SNRs are in
+        the one-vector basis e1 = h1 / |h1| and the grid point's h+, hx are
+        A[:, 0] h1, B[:, 0] h1 (the grid was built in that 1-harmonic
+        subspace): the responses are A[:, 0] |h1|, B[:, 0] |h1|.
+        """
+        nh = numpy.sqrt(numpy.real(self._gram(T, psd, nh=1)[0, 0]))
+        ng = len(T['A'])
+        Ep = numpy.zeros((ng, 5), dtype=complex)
+        Ec = numpy.zeros((ng, 5), dtype=complex)
+        Ep[:, 0] = T['A'][:, 0] * nh
+        Ec[:, 0] = T['B'][:, 0] * nh
+        hpp = numpy.abs(Ep[:, 0]) ** 2
+        hcc = numpy.abs(Ec[:, 0]) ** 2
+        hpc = numpy.conj(Ep[:, 0]) * Ec[:, 0]
+        return Ep, Ec, hpp, hcc, hpc
+
+    def _psd_indices(self, ifo, t):
+        """_psd_index for an array of times (-1 where none covers it)"""
+        st, et = self.psd_times[ifo]
+        mid = 0.5 * (st + et)
+        t = numpy.asarray(t, dtype=numpy.float64)
+        inside = (st[None, :] <= t[:, None]) & (t[:, None] < et[None, :])
+        dist = numpy.where(inside, numpy.abs(mid[None, :] - t[:, None]),
+                           numpy.inf)
+        idx = numpy.argmin(dist, axis=1)
+        if self.psd_mode == 'reference':
+            idx[:] = 0
+        idx[~inside.any(axis=1)] = -1
+        return idx
+
+    def __call__(self, stats, dt, tid, ln_twin2pi, force_loud=False):
+        """
+        Exact term for the coincs given by single-ifo records stats[ifo]
+        (from the statistic's single()), H1-L1 time differences dt (with
+        the time slide applied) and template id tid. Returns NaN where it
+        cannot be computed (the caller then keeps the flow value).
+        """
+        if not self.loaded:
+            self.load()
+        n = len(dt)
+        out = numpy.full(n, numpy.nan)
+        if n == 0 or self._template(tid) is None:
+            return out
+        dt = numpy.asarray(dt, dtype=numpy.float64)
+        h, l = self.ifos
+        ip = {ifo: self._psd_indices(ifo, stats[ifo]['end_time'])
+              for ifo in self.ifos}
+        snr2 = sum(2. * numpy.maximum(numpy.array(stats[ifo]['marg_lnl'],
+                                                  dtype=numpy.float64), 1e-9)
+                   for ifo in self.ifos)
+        ok = (ip[h] >= 0) & (ip[l] >= 0)
+        if self.method == 'reference' or force_loud:
+            quiet = numpy.zeros(n, dtype=bool)
+        else:
+            quiet = ok & (snr2 < self.quiet_snr ** 2)
+        loud = ok & ~quiet
+        sub = lambda m: {ifo: stats[ifo][m] for ifo in self.ifos}
+        keys = numpy.stack([ip[h], ip[l]], axis=1)
+        # quiet coincs: batches sharing the PSD segments
+        for key in (numpy.unique(keys[quiet], axis=0) if quiet.any() else []):
+            m = numpy.nonzero(quiet & (keys[:, 0] == key[0])
+                              & (keys[:, 1] == key[1]))[0]
+            ipsd = (int(key[0]), int(key[1]))
+            try:
+                if self.method == 'ring':
+                    out[m] = self._batch(sub(m), dt[m], tid, ipsd)
+                else:
+                    out[m] = self._grid(sub(m), dt[m], tid, ipsd,
+                                        self.q_nodes,
+                                        orient_step=self.quiet_orient_step,
+                                        prune=None, n_ang=self.quiet_ang)
+                out[m] += ln_twin2pi
+            except Exception as e:  # pylint:disable=broad-except
+                logger.warning('Exact coincident term (batch) failed for '
+                               'template %d: %s', tid, e)
+        self.n_quiet += int(quiet.sum())
+        # loud coincs: one at a time, keeping the orientations that matter
+        for j in numpy.nonzero(loud)[0]:
+            try:
+                if self.method == 'ring':
+                    out[j] = self._one(sub(j), float(dt[j]), tid)
+                elif self.method == 'reference':
+                    out[j] = self._grid(sub([j]), dt[[j]], tid,
+                                        (int(ip[h][j]), int(ip[l][j])),
+                                        self.r_nodes, orient_step=1,
+                                        prune=None, n_ang=64)[0]
+                else:
+                    out[j] = self._grid(sub([j]), dt[[j]], tid,
+                                        (int(ip[h][j]), int(ip[l][j])),
+                                        self.l_nodes, orient_step=1,
+                                        prune=self.prune, n_ang=64)[0]
+                out[j] += ln_twin2pi
+            except Exception as e:      # pylint:disable=broad-except
+                logger.warning('Exact coincident term failed for template '
+                               '%d: %s', tid, e)
+        self.n_loud += int(loud.sum())
+        # spot checks against the yardstick
+        if self.check_frac > 0 and self.method != 'reference' and \
+                not force_loud:
+            chk = numpy.nonzero(ok)[0]
+            chk = chk[self.check_rng.random(len(chk)) < self.check_frac]
+            for j in chk:
+                try:
+                    full = self.reference_value(sub([j]), dt[[j]], tid,
+                                                (int(ip[h][j]),
+                                                 int(ip[l][j]))) + ln_twin2pi
+                    self.check_diffs.append(out[j] - full)
+                    self.check_full.append(full)
+                    self.check_kind.append('quiet' if quiet[j] else 'loud')
+                except Exception:       # pylint:disable=broad-except
+                    pass
+        return out
+
+    def reference_value(self, rec, dt, tid, ipsd):
+        """The yardstick value for one coinc (without ln_twin2pi)"""
+        import time as _time
+        t0, s0 = _time.time(), self.t_coinc
+        if self.check_ref == 'ring':
+            v = self._one({k: v[0] for k, v in rec.items()}, float(dt[0]),
+                          tid)
+        else:
+            if not hasattr(self, 'bhat'):
+                n_e = numpy.stack([numpy.cos(self.lat) * numpy.cos(self.lon),
+                                   numpy.cos(self.lat) * numpy.sin(self.lon),
+                                   numpy.sin(self.lat)], axis=1)
+                self._setup_geometry(n_e, {ifo: numpy.asarray(
+                    self.dets[ifo].response, dtype=numpy.float64)
+                    for ifo in self.ifos})
+            v = self._grid(rec, dt, tid, ipsd, self.r_nodes, orient_step=1,
+                           prune=None, n_ang=64)[0]
+        # checks are not part of the coinc time
+        self.t_coinc = s0
+        return v
+
+    # ---- baseline-coordinate sky quadrature ---------------------------
+    def _setup_geometry(self, n_e, responses):
+        """
+        H1-L1 baseline and detector tensors in the Earth frame, from the
+        Fibonacci sky points' delays and pycbc's antenna patterns (fitted, so
+        the sign conventions are pycbc's own): tau(n) = b . n.
+        """
+        b, res, _, _ = numpy.linalg.lstsq(n_e, self.tau, rcond=None)
+        resid = numpy.abs(n_e @ b - self.tau).max()
+        self.D = float(numpy.linalg.norm(b))
+        self.bhat = b / self.D
+        tmp = numpy.array([1., 0., 0.]) if abs(self.bhat[0]) < 0.9 \
+            else numpy.array([0., 1., 0.])
+        self.e1 = numpy.cross(self.bhat, tmp)
+        self.e1 /= numpy.linalg.norm(self.e1)
+        self.e2 = numpy.cross(self.bhat, self.e1)
+        self.Dt = {ifo: numpy.asarray(r, dtype=numpy.float64)
+                   for ifo, r in responses.items()}
+        self.hand = 1.
+        # check against the Fibonacci points' antenna patterns: |F|^2 is the
+        # same in any polarisation basis; the 2D cross product of F_H and
+        # F_L fixes the handedness
+        sel = numpy.linspace(0, len(n_e) - 1, 4000).astype(int)
+        mine = {ifo: self._ant(n_e[sel], ifo) for ifo in self.ifos}
+        h, l = self.ifos
+        err = 0.
+        for ifo in self.ifos:
+            p0, _, c0, _ = (v[sel].astype(numpy.float64)
+                            for v in self.F[ifo])
+            err = max(err, numpy.abs(mine[ifo][0] ** 2 + mine[ifo][1] ** 2
+                                     - p0 ** 2 - c0 ** 2).max())
+        ph0, _, ch0, _ = (v[sel].astype(numpy.float64) for v in self.F[h])
+        pl0, _, cl0, _ = (v[sel].astype(numpy.float64) for v in self.F[l])
+        cross_p = ph0 * cl0 - ch0 * pl0
+        cross_m = mine[h][0] * mine[l][1] - mine[h][1] * mine[l][0]
+        if numpy.sum(cross_p * cross_m) < 0:
+            self.hand = -1.
+        mine = {ifo: self._ant(n_e[sel], ifo) for ifo in self.ifos}
+        cross_m = mine[h][0] * mine[l][1] - mine[h][1] * mine[l][0]
+        cerr = numpy.abs(cross_m - cross_p).max()
+        logger.info('Exact coincident term, sky quadrature: baseline %.3f '
+                    'ms (delay fit error %.1e s), antenna |F|^2 error %.1e, '
+                    'handedness %+d (error %.1e)', self.D * 1e3, resid, err,
+                    int(self.hand), cerr)
+        if resid > 1e-6 or err > 1e-3 or cerr > 1e-3:
+            raise RuntimeError('Exact coincident term: the baseline '
+                               'geometry does not match pycbc\'s antenna '
+                               'patterns (use exact_method:ring)')
+
+    def _ant(self, n, ifo):
+        """F+, Fx at psi = 0 in a basis of our own (any basis will do, as
+        the polarisation is integrated over a full period)"""
+        z = numpy.array([0., 0., 1.])
+        X = numpy.cross(z, n)
+        nx = numpy.linalg.norm(X, axis=-1, keepdims=True)
+        alt = numpy.cross(numpy.array([1., 0., 0.]), n)
+        X = numpy.where(nx > 1e-6, X, alt)
+        X /= numpy.linalg.norm(X, axis=-1, keepdims=True)
+        Y = numpy.cross(n, X)
+        D = self.Dt[ifo]
+        DX = X @ D
+        DY = Y @ D
+        fp = numpy.sum(X * DX, axis=-1) - numpy.sum(Y * DY, axis=-1)
+        fc = 2. * numpy.sum(X * DY, axis=-1)
+        return fp, self.hand * fc
+
+    def _legendre(self, k):
+        if k not in self._gl:
+            self._gl[k] = numpy.polynomial.legendre.leggauss(k)
+        return self._gl[k]
+
+    def _sky_nodes(self, dt, sigf, n_tau, n_az):
+        """
+        Quadrature nodes over the sky for each coinc: mu = cos(angle to the
+        baseline), on [mu_c - 6 sigma/D, mu_c + 6 sigma/D] cut to [-1, 1]
+        (Gauss-Legendre), and the azimuth around the baseline (evenly
+        spaced). Returns the antenna patterns at psi = 0 per ifo, shape
+        (n, n_tau * n_az), and ln(sky weight x time density) for each node.
+        """
+        x, w = self._legendre(n_tau)
+        mu_c = numpy.clip(dt / self.D, -1., 1.)
+        half = 6. * sigf / self.D
+        a = numpy.maximum(-1., mu_c - half)
+        b = numpy.minimum(1., mu_c + half)
+        mu = 0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * x[None, :]
+        # uniform sky: d mu / 2 (times d phi / 2 pi, below)
+        lnwmu = numpy.log(0.25 * (b - a))[:, None] + numpy.log(w)[None, :]
+        tau = self.D * mu
+        lnT = (-0.5 * ((dt[:, None] - tau) / sigf[:, None]) ** 2
+               - numpy.log(numpy.sqrt(2 * numpy.pi) * sigf)[:, None])
+        phi = 2 * numpy.pi * (numpy.arange(n_az) + 0.5) / n_az
+        st = numpy.sqrt(numpy.maximum(1. - mu ** 2, 0.))
+        nv = (mu[:, :, None, None] * self.bhat
+              + st[:, :, None, None] * (numpy.cos(phi)[None, None, :, None]
+                                        * self.e1
+                                        + numpy.sin(phi)[None, None, :, None]
+                                        * self.e2))
+        nv = nv.reshape(len(dt), n_tau * n_az, 3)
+        F0 = {ifo: self._ant(nv, ifo) for ifo in self.ifos}
+        lnsky = numpy.repeat(lnwmu + lnT, n_az, axis=1) - numpy.log(n_az)
+        self._last_tau = numpy.repeat(tau, n_az, axis=1)
+        return F0, lnsky
+
+    def _singles(self, Q, n_ang, keep=None, lnw=None):
+        """Single-ifo marginal lambda over the antenna-vector angle for each
+        coinc (orientations outside keep left out)"""
+        from scipy.special import logsumexp
+        ang = (numpy.arange(n_ang) + 0.5) * numpy.pi / n_ang
+        ca = numpy.cos(ang)[None, :, None]
+        sa = numpy.sin(ang)[None, :, None]
+        q11, q22, q12, m11, m22, m12 = Q
+        num = (ca ** 2 * q11[:, None, :] + sa ** 2 * q22[:, None, :]
+               + 2 * ca * sa * q12[:, None, :])
+        den = ca ** 2 * m11 + sa ** 2 * m22 + 2 * ca * sa * m12 + 1e-300
+        t = lnw[None, None, :] + num / (2 * den)
+        if keep is not None:
+            t = numpy.where(keep[:, None, :], t, -numpy.inf)
+        return logsumexp(t, axis=(1, 2)) - numpy.log(n_ang)
+
+    def _proj(self, stats, R):
+        """Harmonic SNRs projected on the responses, the quadratic forms and
+        the best single-ifo ln L per orientation"""
+        Z = numpy.stack([numpy.asarray(stats['snr_comp_%d' % q],
+                                       dtype=numpy.float64)
+                         * numpy.exp(1j * numpy.asarray(
+                             stats['coa_phase_comp_%d' % q],
+                             dtype=numpy.float64))
+                         for q in range(1, 6)], axis=1)
+        P = (Z @ R['Ep'].T, Z @ R['Ec'].T)
+        Q = self._quad(P, R)
+        q11, q22, q12, m11, m22, m12 = Q
+        a = m11 * m22 - m12 ** 2
+        b = m11 * q22 + m22 * q11 - 2 * m12 * q12
+        c = q11 * q22 - q12 ** 2
+        a = numpy.where(a > 0, a, 1e-300)
+        lt = 0.25 * (b + numpy.sqrt(numpy.maximum(b * b - 4 * a * c, 0.))) / a
+        return P, Q, lt
+
+    def _grid(self, stats, dt, tid, ipsd, nodes, orient_step=1, prune=None,
+              n_ang=16):
+        """
+        The exact term (without ln_twin2pi) for coincs of one template and
+        one pair of PSD segments, by quadrature: nodes = (n_tau, n_az, n_pol)
+        over the delay, the azimuth around the baseline and the
+        polarisation; every orient_step-th orientation (staggered, each
+        standing for orient_step of them); with prune, only orientations
+        where either ifo is within prune of its own best are kept.
+        """
+        import time as _time
+        t0 = _time.time()
+        s0 = self.t_setup
+        n_tau, n_az, n_pol = nodes
+        T = self._template(tid)
+        h, l = self.ifos
+        R = {h: self._responses(tid, h, ipsd[0]),
+             l: self._responses(tid, l, ipsd[1])}
+        lnw = T['ln_w']
+        n = len(dt)
+        ng = len(lnw)
+        P, Q, lt, snr = {}, {}, {}, {}
+        for ifo in self.ifos:
+            P[ifo], Q[ifo], lt[ifo] = self._proj(stats[ifo], R[ifo])
+            snr[ifo] = numpy.sqrt(2. * numpy.maximum(numpy.asarray(
+                stats[ifo]['marg_lnl'], dtype=numpy.float64), 1e-9))
+        keep_i = None
+        if prune is not None:
+            keep_i = {ifo: lt[ifo] >= lt[ifo].max(axis=1)[:, None] - prune
+                      for ifo in self.ifos}
+        lam = sum(self._singles(Q[ifo], n_ang,
+                                None if keep_i is None else keep_i[ifo], lnw)
+                  for ifo in self.ifos)
+
+        sig0 = numpy.hypot(self.timing_uncertainty * self.snr_reference
+                           / snr[h],
+                           self.timing_uncertainty * self.snr_reference
+                           / snr[l])
+        sigf = numpy.sqrt(sig0 ** 2 + 2 * self.timing_floor ** 2)
+        F0, lnsky = self._sky_nodes(dt, sigf, n_tau, n_az)
+        rot = None
+        if self.phase_time:
+            fb = self.phase_time_freq
+            if fb <= 0:
+                fb = numpy.nanmean([R[h].get('fbar', numpy.nan),
+                                    R[l].get('fbar', numpy.nan)])
+            if numpy.isfinite(fb) and fb > 0:
+                self.fbar_used = getattr(self, 'fbar_used', []) + [fb]
+                # (n, S): rotation of L1's phase at each sky node
+                rot = (-self.phase_time_sign * 2 * numpy.pi * fb
+                       * (dt[:, None] - self._last_tau))
+        pols = (numpy.arange(n_pol) + 0.5) * (numpy.pi / 2) / n_pol
+        c2 = numpy.cos(2 * pols).astype(numpy.float32)
+        s2 = numpy.sin(2 * pols).astype(numpy.float32)
+        lnpol = -numpy.log(n_pol)
+        ln_jac = numpy.log(snr[h] * snr[l])
+
+        if orient_step > 1 and ng > 100:
+            row = numpy.arange(ng) // 24
+            sub = numpy.nonzero((numpy.arange(ng) % orient_step)
+                                == (row % orient_step))[0]
+            lnw_s = lnw[sub] + numpy.log(ng / len(sub))
+        else:
+            sub = numpy.arange(ng)
+            lnw_s = lnw
+        if prune is not None:
+            # per coinc (called with one coinc for loud ones): union
+            kk = numpy.zeros(len(sub), dtype=bool)
+            for ifo in self.ifos:
+                kk |= keep_i[ifo][:, sub].any(axis=0)
+            sub, lnw_s = sub[kk], lnw_s[kk]
+        lnw_s = lnw_s.astype(numpy.float32)
+        S = n_tau * n_az
+        per = S * n_pol * len(sub)
+        chunk = max(1, int(self.batch_elems // max(per, 1)))
+        resp = {ifo: [R[ifo][k][sub].astype(numpy.float32)
+                      for k in ('hpp', 'hcc', 'hpc')] for ifo in self.ifos}
+        joint = numpy.empty(n)
+        f32 = numpy.float32
+        for s_ in range(0, n, chunk):
+            sl = slice(s_, s_ + chunk)
+            F, Pri = {}, {}
+            for ifo in self.ifos:
+                f0, g0 = (v[sl].astype(f32)[:, :, None] for v in F0[ifo])
+                F[ifo] = ((f0 * c2 + g0 * s2)[..., None],     # (m, S, P, 1)
+                          (g0 * c2 - f0 * s2)[..., None])
+                pp = P[ifo][0][sl][:, sub]
+                pc = P[ifo][1][sl][:, sub]
+                Pri[ifo] = tuple(x.astype(f32)[:, None, None, :] for x in
+                                 (pp.real, pc.real, pp.imag, pc.imag))
+            rr = None
+            if rot is not None:
+                rs = rot[sl]
+                rr = (numpy.cos(rs).astype(f32)[:, :, None, None],
+                      numpy.sin(rs).astype(f32)[:, :, None, None])
+            tot = self._kernel(F, Pri, resp, lnw_s,
+                               lnsky[sl].astype(f32)[:, :, None, None], rr)
+            m = tot.reshape(len(tot), -1).max(axis=1)
+            tot -= m[:, None, None, None]
+            numpy.exp(tot, out=tot)
+            ssum = tot.reshape(len(tot), -1).sum(axis=1, dtype=numpy.float64)
+            joint[sl] = m + numpy.log(ssum) + lnpol + ln_jac[sl]
+            del tot
+        self.t_coinc += _time.time() - t0 - (self.t_setup - s0)
+        return joint - lam
+
+    def _kernel(self, F, Pri, resp, lnw, lnsky, rot=None):
+        """
+        ln of the joint integrand at every (coinc, sky node, polarisation,
+        orientation), in single-precision real arithmetic (no complex
+        temporaries):
+            L_J + d2 eps2|a_J|^2 / (2 V0 V) - ln(2 pi Y_L V) + ln w + ln sky
+        with X_d = F+ P+ + Fx Px, Y_d = F.M.F, a_J = X_J / Y_J, d2 =
+        |X_L/Y_L - X_H/Y_H|^2, V0 = 1/Y_H + 1/Y_L, V = V0 + eps2 |a_J|^2
+        (the same as L_H + L_L - d2 / 2V + ln density, written so that
+        nothing cancels).
+        """
+        f32 = numpy.float32
+        h, l = self.ifos
+        out = {}
+        for ifo in (h, l):
+            fp, fc = F[ifo]
+            hpp, hcc, hpc = resp[ifo]
+            Y = (fp * fp) * hpp
+            Y += (fc * fc) * hcc
+            Y += (2 * fp * fc) * hpc
+            Y += f32(1e-30)
+            ppr, pcr, ppi, pci = Pri[ifo]
+            xr = fp * ppr
+            xr += fc * pcr
+            xi = fp * ppi
+            xi += fc * pci
+            out[ifo] = (Y, xr, xi)
+        Yh, xrh, xih = out[h]
+        Yl, xrl, xil = out[l]
+        if rot is not None:
+            # L1's phase rotated back by the time-phase coupling at each sky
+            # node (cos, sin of shape (m, S, 1, 1))
+            cr, sr = rot
+            xrl, xil = xrl * cr - xil * sr, xrl * sr + xil * cr
+        YJ = Yh + Yl
+        # d2, using the per-ifo best-fit amplitudes
+        ar = xrl / Yl
+        ar -= xrh / Yh
+        ai = xil / Yl
+        ai -= xih / Yh
+        d2 = ar * ar
+        ai *= ai
+        d2 += ai
+        del ar, ai
+        xrh += xrl
+        xih += xil
+        del xrl, xil
+        nJ = xrh * xrh
+        xih *= xih
+        nJ += xih
+        del xrh, xih
+        V0 = YJ / (Yh * Yl)
+        e = nJ / (YJ * YJ)
+        e *= f32(self.eps2)
+        V = V0 + e
+        tot = nJ / (2 * YJ)                       # L_J
+        e *= d2
+        e /= (2 * V0 * V)
+        tot += e
+        del e, d2, V0, nJ
+        V *= Yl
+        V *= f32(2 * numpy.pi)
+        numpy.log(V, out=V)
+        tot -= V
+        tot += lnw
+        tot += lnsky
+        return tot
+
+    def trigger_terms(self, ifo, stats, tid):
+        """
+        For single triggers of one ifo and template: c = (best ln L over the
+        orientations and polarisation mix) - lambda, and the SNR used in the
+        exact term. c bounds how much the other ifo's trigger can raise the
+        joint sum (see ExpFitFgBgNormMARGExactStatistic.coinc_upper_bound).
+        NaN where it cannot be computed.
+        """
+        if not self.loaded:
+            self.load()
+        n = len(stats)
+        c = numpy.full(n, numpy.nan)
+        rho = numpy.sqrt(2. * numpy.maximum(numpy.asarray(
+            stats['marg_lnl'], dtype=numpy.float64), 1e-9))
+        if n == 0 or self._template(tid) is None:
+            return c, rho
+        import time as _time
+        t0 = _time.time()
+        s0 = self.t_setup
+        ip = self._psd_indices(ifo, stats['end_time'])
+        lnw = self._template(tid)['ln_w']
+        # One response set per template and ifo (the median PSD): c only has
+        # to bound the coinc term, and the bound's margin covers the small
+        # PSD dependence. Computing it per PSD segment for every trigger was
+        # much slower than the coincs themselves.
+        m = numpy.nonzero(ip >= 0)[0]
+        try:
+            R = self._responses(tid, ifo, 'ref')
+            for s_ in range(0, len(m), 4000):
+                mm = m[s_:s_ + 4000]
+                _, Q, lt = self._proj(stats[mm], R)
+                lam = self._singles(Q, 8, None, lnw)
+                c[mm] = lt.max(axis=1) - lam
+        except Exception as e:  # pylint:disable=broad-except
+            logger.warning('Exact term bound failed for template %d: %s',
+                           tid, e)
+        self.t_bterms = getattr(self, 't_bterms', 0.) + _time.time() - t0 \
+            - (self.t_setup - s0)
+        self.n_bterms = getattr(self, 'n_bterms', 0) + n
+        self._bt_calls = getattr(self, '_bt_calls', 0) + 1
+        if self._bt_calls <= 4 or self._bt_calls % 20 == 0:
+            logger.info('Exact term bound terms: template %d %s, %d triggers, '
+                        '%.1f s so far (%d calls)', tid, ifo, n,
+                        self.t_bterms, self._bt_calls)
+        return c, rho
+
+    def _batch(self, stats, dt, tid, ipsd):
+        """
+        The exact term for many quiet coincs of one template at once (same
+        PSD segments), with quiet_ring sky points along each coinc's ring,
+        quiet_pol polarisations and quiet_ang antenna angles for the
+        single-ifo marginals. Same quantity as _one.
+        """
+        import time as _time
+        from scipy.special import logsumexp
+        t0 = _time.time()
+        s0 = self.t_setup
+        T = self._template(tid)
+        h, l = self.ifos
+        R = {h: self._responses(tid, h, ipsd[0]),
+             l: self._responses(tid, l, ipsd[1])}
+        lnw = T['ln_w']
+        n = len(dt)
+        ng = len(lnw)
+        P, Q, lt, snr = {}, {}, {}, {}
+        for ifo in self.ifos:
+            st = stats[ifo]
+            Z = numpy.stack([st['snr_comp_%d' % q]
+                             * numpy.exp(1j * st['coa_phase_comp_%d' % q])
+                             for q in range(1, 6)], axis=1).astype(complex)
+            P[ifo] = (Z @ R[ifo]['Ep'].T, Z @ R[ifo]['Ec'].T)     # (n, ng)
+            Q[ifo] = self._quad(P[ifo], R[ifo])
+            q11, q22, q12, m11, m22, m12 = Q[ifo]
+            a = m11 * m22 - m12 ** 2
+            b = m11 * q22 + m22 * q11 - 2 * m12 * q12
+            c = q11 * q22 - q12 ** 2
+            a = numpy.where(a > 0, a, 1e-300)
+            lt[ifo] = 0.25 * (b + numpy.sqrt(numpy.maximum(b * b - 4 * a * c,
+                                                           0.))) / a
+            snr[ifo] = numpy.sqrt(2. * numpy.maximum(
+                numpy.array(st['marg_lnl'], dtype=numpy.float64), 1e-9))
+
+        # single-ifo marginals over the antenna angle
+        na = self.quiet_ang
+        ang = (numpy.arange(na) + 0.5) * numpy.pi / na
+        ca, sa = numpy.cos(ang)[None, :, None], numpy.sin(ang)[None, :, None]
+        lam = numpy.zeros(n)
+        for ifo in self.ifos:
+            q11, q22, q12, m11, m22, m12 = Q[ifo]
+            num = (ca ** 2 * q11[:, None, :] + sa ** 2 * q22[:, None, :]
+                   + 2 * ca * sa * q12[:, None, :])
+            den = (ca ** 2 * m11 + sa ** 2 * m22 + 2 * ca * sa * m12
+                   + 1e-300)
+            lam += logsumexp(lnw[None, None, :] + num / (2 * den),
+                             axis=(1, 2)) - numpy.log(na)
+
+        # ring of each coinc: quiet_ring points spread evenly along it
+        sig0 = numpy.hypot(self.timing_uncertainty * self.snr_reference
+                           / snr[h],
+                           self.timing_uncertainty * self.snr_reference
+                           / snr[l])
+        sigf = numpy.sqrt(sig0 ** 2 + 2 * self.timing_floor ** 2)
+        lo = numpy.searchsorted(self.tau_sorted, dt - 6 * sigf)
+        hi = numpy.searchsorted(self.tau_sorted, dt + 6 * sigf)
+        nr = self.quiet_ring
+        # as in _one: if the ring is (nearly) empty, e.g. dt beyond the light
+        # travel time, use the 50 closest delays
+        short = (hi - lo) < 50
+        c0 = numpy.searchsorted(self.tau_sorted, dt)
+        lo = numpy.where(short, numpy.clip(c0 - 25, 0, self.n_fine - 50), lo)
+        hi = numpy.where(short, lo + 50, hi)
+        span = (hi - lo).astype(numpy.float64)
+        k = (numpy.arange(nr) + 0.5) / nr
+        pos = lo[:, None] + numpy.floor(span[:, None] * k[None, :]).astype(int)
+        near = self.tau_order[numpy.clip(pos, 0, self.n_fine - 1)]  # (n, nr)
+        npol = self.quiet_pol
+        pols = (numpy.arange(npol) + 0.5) * (numpy.pi / 2) / npol
+        c2 = numpy.cos(2 * pols).astype(numpy.float32)
+        s2 = numpy.sin(2 * pols).astype(numpy.float32)
+        tau = self.tau[near]                                      # (n, nr)
+        lnT = (-0.5 * ((dt[:, None] - tau) / sigf[:, None]) ** 2
+               - numpy.log(numpy.sqrt(2 * numpy.pi) * sigf)[:, None])
+        lnsky = numpy.log(span / (nr * self.n_fine))              # (n,)
+        lnpol = -numpy.log(npol)
+        ln_jac = numpy.log(snr[h] * snr[l])
+
+        k = self.quiet_orient_step
+        if k > 1 and ng > 100:
+            row = numpy.arange(ng) // 24
+            sub = numpy.nonzero((numpy.arange(ng) % k) == (row % k))[0]
+            lnw_j = lnw[sub] + numpy.log(ng / len(sub))
+        else:
+            sub = numpy.arange(ng)
+            lnw_j = lnw
+        lnw_j = lnw_j.astype(numpy.float32)
+        ngj = len(sub)
+        per = nr * npol * ngj
+        chunk = max(1, int(self.batch_elems // per))
+        joint = numpy.empty(n)
+        hpp = {ifo: R[ifo]['hpp'][sub].astype(numpy.float32)
+               for ifo in self.ifos}
+        hcc = {ifo: R[ifo]['hcc'][sub].astype(numpy.float32)
+               for ifo in self.ifos}
+        hpc = {ifo: R[ifo]['hpc'][sub].astype(numpy.float32)
+               for ifo in self.ifos}
+        lnT32 = lnT.astype(numpy.float32)
+        for s_ in range(0, n, chunk):
+            sl = slice(s_, s_ + chunk)
+            X, Y = {}, {}
+            for ifo in self.ifos:
+                p0, p4, q0, q4 = (v[near[sl]][:, :, None]
+                                  for v in self.F[ifo])
+                fp = (p0 * c2 + p4 * s2)[..., None]       # (m, nr, npol, 1)
+                fc = (q0 * c2 + q4 * s2)[..., None]
+                pp = P[ifo][0][sl][:, sub].astype(numpy.complex64)[:, None, None, :]
+                pc = P[ifo][1][sl][:, sub].astype(numpy.complex64)[:, None, None, :]
+                X[ifo] = fp * pp + fc * pc
+                Y[ifo] = (fp ** 2 * hpp[ifo] + fc ** 2 * hcc[ifo]
+                          + 2. * fp * fc * hpc[ifo] + numpy.float32(1e-30))
+            YJ = Y[h] + Y[l]
+            XJ = X[h] + X[l]
+            LJ = numpy.abs(XJ) ** 2 / (2 * YJ)
+            d2 = numpy.abs(X[l] / Y[l] - X[h] / Y[h]) ** 2
+            V0 = 1. / Y[h] + 1. / Y[l]
+            V = V0 + self.eps2 * numpy.abs(XJ / YJ) ** 2
+            core = LJ + d2 / (2 * V0) - d2 / (2 * V) \
+                - numpy.log(2 * numpy.pi * Y[l] * V)
+            tot = core + lnw_j + lnT32[sl][:, :, None, None]
+            m = tot.reshape(len(tot), -1).max(axis=1)
+            ssum = numpy.exp(tot - m[:, None, None, None]).reshape(
+                len(tot), -1).sum(axis=1, dtype=numpy.float64)
+            joint[sl] = m + numpy.log(ssum) + lnsky[sl] + lnpol + ln_jac[sl]
+            del X, Y, YJ, XJ, LJ, d2, V0, V, core, tot
+        self.t_coinc += _time.time() - t0 - (self.t_setup - s0)
+        return joint - lam
+
+    @staticmethod
+    def _quad(P, R):
+        """
+        Single-ifo quadratic forms over the polarisation mix: for antenna
+        vector F = (F+, Fx), |X|^2 = F.Q.F and sigma^2 = F.M.F, so the
+        single-ifo log likelihood is (F.Q.F) / (2 F.M.F).
+        """
+        pp, pc = P
+        q11 = numpy.abs(pp) ** 2
+        q22 = numpy.abs(pc) ** 2
+        q12 = numpy.real(numpy.conj(pp) * pc)
+        return q11, q22, q12, R['hpp'], R['hcc'], R['hpc']
+
+    def _one(self, rec, dt, tid):
+        import time as _time
+        from scipy.special import logsumexp
+        t0 = _time.time()
+        s0 = self.t_setup
+        T = self._template(tid)
+        R, P, Q, lt, snrs = {}, {}, {}, {}, []
+        for ifo in self.ifos:
+            r = rec[ifo]
+            ipsd = self._psd_index(ifo, float(r['end_time']))
+            if ipsd is None:
+                return numpy.nan
+            R[ifo] = self._responses(tid, ifo, ipsd)
+            z = numpy.array([r['snr_comp_%d' % q]
+                             * numpy.exp(1j * r['coa_phase_comp_%d' % q])
+                             for q in range(1, 6)], dtype=complex)
+            P[ifo] = (R[ifo]['Ep'] @ z, R[ifo]['Ec'] @ z)
+            Q[ifo] = self._quad(P[ifo], R[ifo])
+            q11, q22, q12, m11, m22, m12 = Q[ifo]
+            # best single-ifo ln L at each orientation over the polarisation
+            # mix: largest generalised eigenvalue of (Q, M), over 2
+            a = m11 * m22 - m12 ** 2
+            b = m11 * q22 + m22 * q11 - 2 * m12 * q12
+            c = q11 * q22 - q12 ** 2
+            a = numpy.where(a > 0, a, 1e-300)
+            lt[ifo] = 0.25 * (b + numpy.sqrt(numpy.maximum(b * b - 4 * a * c,
+                                                           0.))) / a
+            snrs.append(numpy.sqrt(2. * max(float(r['marg_lnl']), 1e-9)))
+        lnw_all = T['ln_w']
+
+        # single-ifo marginals: for one ifo the sky position and polarisation
+        # only enter through the antenna vector's angle (its length is
+        # absorbed by the amplitude fit), which is uniform: average over the
+        # angle directly, at the orientations within prune of the best
+        ang = self.ang
+        ca, sa = numpy.cos(ang)[:, None], numpy.sin(ang)[:, None]
+        lam = 0.
+        for ifo in self.ifos:
+            k = lt[ifo] >= lt[ifo].max() - self.prune
+            q11, q22, q12, m11, m22, m12 = [v[k] for v in Q[ifo]]
+            num = ca ** 2 * q11 + sa ** 2 * q22 + 2 * ca * sa * q12
+            den = ca ** 2 * m11 + sa ** 2 * m22 + 2 * ca * sa * m12 + 1e-300
+            lam += logsumexp(lnw_all[k][None, :] + num / (2 * den)) \
+                - numpy.log(len(ang))
+
+        # joint: orientations where either ifo is within prune of its own
+        # best (not only where the two together are: when the amplitude/
+        # phase penalty is large, the orientation that dominates the joint
+        # sum need not be one where the separate fits are best), and the
+        # ring of sky positions whose delay matches dt
+        keep = numpy.zeros(len(lnw_all), dtype=bool)
+        for ifo in self.ifos:
+            keep |= lt[ifo] >= lt[ifo].max() - self.prune
+        lnw = lnw_all[keep]
+        sig0 = numpy.hypot(*[self.timing_uncertainty * self.snr_reference / s
+                             for s in snrs])
+        sigf = numpy.sqrt(sig0 ** 2 + 2 * self.timing_floor ** 2)
+        lo = numpy.searchsorted(self.tau_sorted, dt - 6 * sigf)
+        hi = numpy.searchsorted(self.tau_sorted, dt + 6 * sigf)
+        if hi - lo < 50:
+            c0 = numpy.searchsorted(self.tau_sorted, dt)
+            lo, hi = max(0, c0 - 25), min(self.n_fine, c0 + 25)
+        step = max(1, int(numpy.ceil((hi - lo) / self.max_ring)))
+        near = self.tau_order[lo:hi:step]
+        h, l = self.ifos
+        nr, npol = len(near), self.n_pol
+        c2 = numpy.cos(2 * self.pols).astype(numpy.float32)
+        s2 = numpy.sin(2 * self.pols).astype(numpy.float32)
+        X, Y = {}, {}
+        for ifo in self.ifos:
+            p0, p4, q0, q4 = (v[near][:, None] for v in self.F[ifo])
+            fp = (p0 * c2 + p4 * s2)[:, :, None]
+            fc = (q0 * c2 + q4 * s2)[:, :, None]
+            Rr = R[ifo]
+            pp = P[ifo][0][keep].astype(numpy.complex64)
+            pc = P[ifo][1][keep].astype(numpy.complex64)
+            X[ifo] = fp * pp + fc * pc
+            Y[ifo] = (fp ** 2 * Rr['hpp'][keep].astype(numpy.float32)
+                      + fc ** 2 * Rr['hcc'][keep].astype(numpy.float32)
+                      + 2. * fp * fc * Rr['hpc'][keep].astype(numpy.float32)
+                      + numpy.float32(1e-30))
+        YJ = Y[h] + Y[l]
+        LJ = numpy.abs(X[h] + X[l]) ** 2 / (2 * YJ)
+        # amplitude/phase density with the systematic floor
+        aH, aL = X[h] / Y[h], X[l] / Y[l]
+        V0 = 1. / Y[h] + 1. / Y[l]
+        V = V0 + self.eps2 * numpy.abs((X[h] + X[l]) / YJ) ** 2
+        d2 = numpy.abs(aL - aH) ** 2
+        # LH + LL - pen, with pen = d2 / 2V  (= LJ + d2 / 2V0 - d2 / 2V)
+        core = LJ + d2 / (2 * V0) - d2 / (2 * V)
+        ln_dens = numpy.log(snrs[0] * snrs[1]) - numpy.log(2 * numpy.pi * Y[l] * V)
+        tau = self.tau[near]
+        lnT = (-0.5 * ((dt - tau) / sigf) ** 2
+               - numpy.log(numpy.sqrt(2 * numpy.pi) * sigf))[:, None, None]
+        lnpol = -numpy.log(npol)
+        w_abs = lnw[None, None, :] + numpy.log(step / self.n_fine) + lnpol
+        joint = logsumexp((w_abs + core + ln_dens + lnT).astype(numpy.float64))
+        # coinc time only: leave out any template setup done in this call
+        self.t_coinc += _time.time() - t0 - (self.t_setup - s0)
+        return joint - lam
+
+
+class ExpFitFgBgNormMARGExactStatistic(ExpFitFgBgNormMARGStatistic):
+    """
+    phasetd_exp_fit_fgbg_norm_marg with the coincident term computed exactly
+    (ExactCoincTerm) for EVERY coinc, precessing and aligned-spin, instead of
+    by the flows.
+
+    The coincident term of phasetd_exp_fit_fgbg_norm_marg is
+        (signal flow + Jacobian - noise flow) - log(noise volume)
+    and is replaced here by ExactCoincTerm's value. The single-detector
+    noise rates, network sensitivity and SNR^-4 terms are unchanged, so the
+    two statistics differ only in the coincident term. The flow value is
+    still computed and kept in self.last_flow (one array per call), so the
+    two can be compared coinc by coinc (pycbc_coinc_findtrigs writes it as
+    'stat_flow'). Where the exact term cannot be computed (no PSD covering
+    the trigger time, template missing from the grid) the flow value is
+    used and counted in self.n_fallback.
+
+    Statistic keywords (--statistic-keywords KEY:VALUE):
+      exact_grid           marginalisation grid file (as for the inspiral)
+      exact_bank           template bank (BANK2HDF; pycbc_coinc_findtrigs
+                           passes its --template-bank automatically)
+      exact_psd_<IFO>      merged PSD file of each ifo (MERGE_PSDS)
+      exact_max_ring, exact_n_pol, exact_prune, exact_amp_phase_floor,
+      exact_timing_floor, exact_timing_uncertainty, exact_snr_reference,
+      exact_n_fine        see ExactCoincTerm
+    """
+
+    def __init__(self, sngl_ranking, files=None, ifos=None, **kwargs):
+        ex = {k[6:]: kwargs.pop(k) for k in list(kwargs)
+              if k.startswith('exact_')}
+        ExpFitFgBgNormMARGStatistic.__init__(self, sngl_ranking, files=files,
+                                             ifos=ifos, **kwargs)
+        self.single_dtype.append(('template_id', numpy.int64))
+        psds = {k[4:]: ex.pop(k) for k in list(ex) if k.startswith('psd_')}
+        grid = ex.pop('grid', None)
+        bank = ex.pop('bank', None)
+        missing = [n for n, v in [('exact_grid', grid), ('exact_bank', bank)]
+                   if v is None]
+        missing += ['exact_psd_%s' % i for i in self.ifos if i not in psds]
+        if missing:
+            raise ValueError('The exact statistic needs the statistic '
+                             'keywords %s' % ', '.join(missing))
+        if not self.has_hist:
+            self.get_hist()
+        def conv(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return v
+        # exact_flow:0 skips the flow statistic (kept only where the exact
+        # term fails); exact_check_bound:1 compares every computed coinc with
+        # its upper bound (pycbc_coinc_findtrigs then filters nothing)
+        self.compute_flow = bool(conv(ex.pop('flow', 0)))
+        self.check_bound = bool(conv(ex.pop('check_bound', 0)))
+        self.single_dtype.append(('exact_c', numpy.float32))
+        self.single_dtype.append(('exact_rho', numpy.float32))
+        self.exact = ExactCoincTerm(self.model_ifos, grid, bank, psds,
+                                    **{k: conv(v) for k, v in ex.items()})
+        self.n_exact = 0
+        self.n_fallback = 0
+        self.last_flow = None
+        self.rho_range = {}
+        self.bound_viol = 0
+        self.bound_checked = 0
+        self.bound_excess = []
+        self.bound_tested = 0
+        self.bound_passed = 0
+
+    def single(self, trigs):
+        singles = ExpFitFgBgNormMARGStatistic.single(self, trigs)
+        try:
+            singles['template_id'] = trigs.template_num
+        except AttributeError:
+            singles['template_id'] = trigs['template_id'][:]
+        # per-trigger terms of the upper bound used to skip coincs that
+        # cannot reach a decimation threshold
+        singles['exact_c'] = numpy.nan
+        singles['exact_rho'] = numpy.sqrt(2. * numpy.maximum(
+            singles['marg_lnl'].astype(numpy.float64), 1e-9))
+        ifo = getattr(trigs, 'ifo', None)
+        if ifo in self.model_ifos and len(singles):
+            try:
+                tid = int(numpy.atleast_1d(singles['template_id'])[0])
+                if numpy.all(singles['template_id'] == tid):
+                    c, _ = self.exact.trigger_terms(ifo, singles, tid)
+                    singles['exact_c'] = c
+            except Exception as e:  # pylint:disable=broad-except
+                logger.warning('Exact term bound terms failed: %s', e)
+            r = singles['exact_rho']
+            self.rho_range[ifo] = (float(r.min()), float(r.max()))
+        return singles
+
+    def _exact_bound_terms(self, rho_ref, rho_oth, c_ref, c_oth,
+                           time_addition, dt=None):
+        """
+        Upper bound on (exact term + SNR terms): the amplitude/phase density
+        is at most rho_H rho_L / 2 pi, and the joint sum at most e^(best
+        ln L) of one ifo times the other's marginal times the sky-averaged
+        time density, so the orientation/sky consistency adds at most
+        min(c_H, c_L).
+        """
+        ex = self.exact
+        if not ex.loaded:
+            ex.load()
+        noise_twindow = coinc_rate.multiifo_noise_coincident_area(
+            self.hist_ifos, time_addition)
+        sig0 = numpy.hypot(ex.timing_uncertainty * ex.snr_reference / rho_ref,
+                           ex.timing_uncertainty * ex.snr_reference / rho_oth)
+        sigf = numpy.sqrt(sig0 ** 2 + 2 * ex.timing_floor ** 2)
+        c = numpy.minimum(c_ref, c_oth)
+        c = numpy.where(numpy.isfinite(c), c, numpy.inf)
+        # For one ifo the average of e^{ln L} over the polarisation is the
+        # same at every sky position (only the antenna vector's angle
+        # matters, and it is uniform), so after bounding the other ifo's
+        # factor by its maximum, the time density only enters through its
+        # all-sky average: (Phi((D - dt)/s) - Phi((-D - dt)/s)) / 2D, at
+        # most 1/2D when dt is not known
+        from scipy.special import ndtr
+        D = getattr(ex, 'D', 0.010)
+        if dt is None:
+            lnT = -numpy.log(2 * D) + 0. * sigf
+        else:
+            p = ndtr((D - dt) / sigf) - ndtr((-D - dt) / sigf)
+            lnT = numpy.log(numpy.maximum(p, 1e-300)) - numpy.log(2 * D)
+        return (lnT + numpy.log(noise_twindow * 2 * numpy.pi)
+                + numpy.log(rho_oth) - 4. * numpy.log(rho_ref / self.ref_snr)
+                - numpy.log(2 * numpy.pi)
+                + c + ex.bound_margin)
+
+    def _base(self, s, time_addition):
+        sngl_rates = {sngl[0]: sngl[1]['snglstat'] for sngl in s}
+        ln_noise_rate = coinc_rate.combination_noise_lograte(
+                                  sngl_rates, time_addition)
+        ln_noise_rate -= self.benchmark_lograte
+        network_sigmasq = numpy.amin([sngl[1]['sigmasq'] for sngl in s],
+                                     axis=0)
+        network_logvol = 1.5 * numpy.log(network_sigmasq)
+        network_logvol -= s[0][1]['benchmark_logvol']
+        return network_logvol - ln_noise_rate
+
+    def coinc_upper_bound(self, s, slide, step, to_shift, **kwargs):
+        """
+        Upper bound on rank_stat_coinc for each coinc, from single-trigger
+        quantities only (cheap): coincs whose bound is below a decimation
+        threshold need not be computed.
+        """
+        stat = {ifo: st for ifo, st in s}
+        ref, other = self.model_ifos[0], self.model_ifos[1]
+        shift = {ifo: sh for ifo, sh in zip(self.ifos, to_shift)}
+        sh = numpy.array(slide * step, dtype=numpy.float64, ndmin=1)
+        dt = (stat[ref]['end_time'] + sh * shift[ref]) \
+            - (stat[other]['end_time'] + sh * shift[other])
+        ub = self._base(s, kwargs['time_addition']) + self._exact_bound_terms(
+            stat[ref]['exact_rho'].astype(numpy.float64),
+            stat[other]['exact_rho'].astype(numpy.float64),
+            stat[ref]['exact_c'].astype(numpy.float64),
+            stat[other]['exact_c'].astype(numpy.float64),
+            kwargs['time_addition'], dt=dt)
+        return numpy.where(numpy.isfinite(ub), ub, numpy.inf)
+
+    def rank_stat_coinc(self, s, slide, step, to_shift,
+                        **kwargs): # pylint:disable=unused-argument
+        """
+        The coincident statistic with the exact coincident term. The flow
+        statistic for the same coincs is left in self.last_flow.
+        """
+        sngl_rates = {sngl[0]: sngl[1]['snglstat'] for sngl in s}
+        ln_noise_rate = coinc_rate.combination_noise_lograte(
+                                  sngl_rates, kwargs['time_addition'])
+        ln_noise_rate -= self.benchmark_lograte
+        network_sigmasq = numpy.amin([sngl[1]['sigmasq'] for sngl in s],
+                                     axis=0)
+        network_logvol = 1.5 * numpy.log(network_sigmasq)
+        benchmark_logvol = s[0][1]['benchmark_logvol']
+        network_logvol -= benchmark_logvol
+        base = network_logvol - ln_noise_rate
+
+        stat = {ifo: st for ifo, st in s}
+        noise_twindow = coinc_rate.multiifo_noise_coincident_area(
+                            self.hist_ifos, kwargs['time_addition'])
+
+        n_ifos = len(self.hist_ifos)
+        hist_vol = noise_twindow * (2 * numpy.pi * 2 * numpy.pi) ** (n_ifos - 1)
+        hist_vol_aligned = noise_twindow * (2 * numpy.pi) ** (n_ifos - 1)
+
+        def flow_stat(m):
+            # the flow statistic for the coincs in mask m
+            st = {ifo: stat[ifo][m] for ifo in stat}
+            shf = numpy.array(slide * step, dtype=numpy.float64, ndmin=1)
+            shf = shf[m] if len(shf) == len(m) else shf
+            logr_s = self.logsignalrate(st, shf, to_shift)
+            aligned = self.is_aligned(st[self.model_ifos[0]]['beta'])
+            logr_n = numpy.where(aligned, - numpy.log(hist_vol_aligned),
+                                 - numpy.log(hist_vol))
+            f = base[m] + logr_s - logr_n
+            f[f < -30.] = -30.
+            return f
+
+        n = len(base)
+        flow = numpy.full(n, numpy.nan)
+        if self.compute_flow and n:
+            flow = flow_stat(numpy.ones(n, dtype=bool))
+        self.last_flow = flow.copy()
+        if n == 0:
+            return flow
+        ref, other = self.model_ifos[0], self.model_ifos[1]
+        shift = {ifo: sh for ifo, sh in zip(self.ifos, to_shift)}
+        sh = numpy.array(slide * step, dtype=numpy.float64, ndmin=1)
+        if len(sh) == 1:
+            sh = numpy.repeat(sh, n)
+        dt = (stat[ref]['end_time'] + sh * shift[ref]) \
+            - (stat[other]['end_time'] + sh * shift[other])
+        # SNR^-4 population and reference-SNR Jacobian, as in logsignalrate
+        snr_ref = numpy.sqrt(2. * numpy.maximum(
+            numpy.array(stat[ref]['marg_lnl'], dtype=numpy.float64,
+                        ndmin=1), 1e-30))
+        snr_terms = -numpy.log(snr_ref) - 4. * numpy.log(snr_ref / self.ref_snr)
+        tids = numpy.array(stat[ref]['template_id'], ndmin=1)
+        ex = numpy.full(n, numpy.nan)
+        ln_twin2pi = numpy.log(noise_twindow * 2 * numpy.pi)
+        for tid in numpy.unique(tids):
+            m = tids == tid
+            ex[m] = self.exact({ifo: stat[ifo][m] for ifo in self.model_ifos},
+                               dt[m], int(tid), ln_twin2pi)
+        loglr = base + snr_terms + ex
+        # recompute the louder quiet coincs with the loud settings
+        snr2 = sum(2. * numpy.maximum(numpy.asarray(stat[i]['marg_lnl'],
+                                                    dtype=numpy.float64), 0.)
+                   for i in self.model_ifos)
+        redo = numpy.isfinite(loglr) & (loglr > self.exact.refine_above) & \
+            (snr2 < self.exact.quiet_snr ** 2) & \
+            (self.exact.method == 'grid')
+        for tid in numpy.unique(tids[redo]):
+            m = redo & (tids == tid)
+            ex[m] = self.exact({ifo: stat[ifo][m] for ifo in self.model_ifos},
+                               dt[m], int(tid), ln_twin2pi, force_loud=True)
+            self.exact.n_refined += int(m.sum())
+        loglr = base + snr_terms + ex
+        bad = ~numpy.isfinite(loglr)
+        if bad.any():
+            if not self.compute_flow:
+                flow[bad] = flow_stat(bad)
+                self.last_flow = flow.copy()
+            loglr[bad] = flow[bad]
+        self.n_exact += int((~bad).sum())
+        self.n_fallback += int(bad.sum())
+        if self.check_bound:
+            ub = self.coinc_upper_bound(s, slide, step, to_shift, **kwargs)
+            g = ~bad
+            self.bound_checked += int(g.sum())
+            over = g & (loglr > ub + 1e-6)
+            self.bound_viol += int(over.sum())
+            self.bound_excess += list((loglr - ub)[g])
+        loglr[loglr < -30.] = -30.
+        return loglr
+
+    def coinc_lim_for_thresh(self, s, thresh, limifo,
+                             **kwargs): # pylint:disable=unused-argument
+        """
+        For each trigger of the fixed ifo, the largest limifo single
+        statistic (log noise rate) with which a coinc could still reach
+        thresh: coinc_upper_bound at its most favourable over the limifo
+        triggers of this template (their SNR range, recorded in single()).
+        """
+        n = len(s[0][1]['snglstat'])
+        if thresh <= -30 or self.check_bound or limifo not in self.rho_range:
+            return numpy.ones(n) * numpy.inf
+        fixed = s[0][0]
+        fs = s[0][1]
+        rmin, rmax = self.rho_range[limifo]
+        sngl_rates = {fixed: fs['snglstat']}
+        sngl_rates[limifo] = numpy.zeros(n)
+        ln_noise_rate = coinc_rate.combination_noise_lograte(
+                                  sngl_rates, kwargs['time_addition'])
+        ln_noise_rate -= self.benchmark_lograte
+        network_logvol = 1.5 * numpy.log(numpy.ones(n) * kwargs['max_sigmasq'])
+        network_logvol -= fs['benchmark_logvol']
+        rf = fs['exact_rho'].astype(numpy.float64)
+        cf = fs['exact_c'].astype(numpy.float64)
+        ref = self.model_ifos[0]
+        if limifo == ref:
+            # bound terms grow as the ref SNR falls (rho^-4) and as either
+            # SNR rises (time density): take each at its best
+            terms = self._exact_bound_terms(numpy.ones(n) * rmax, rf,
+                                            numpy.inf, cf,
+                                            kwargs['time_addition'])
+            terms += 4. * numpy.log(rmax / self.ref_snr) \
+                - 4. * numpy.log(rmin / self.ref_snr)
+        else:
+            terms = self._exact_bound_terms(rf, numpy.ones(n) * rmax,
+                                            cf, numpy.inf,
+                                            kwargs['time_addition'])
+        lim = - thresh + network_logvol - ln_noise_rate + terms
+        return numpy.where(numpy.isfinite(lim), lim, numpy.inf)
+
+
 statistic_dict = {
     "quadsum": QuadratureSumStatistic,
     "single_ranking_only": QuadratureSumStatistic,
@@ -3555,6 +5082,7 @@ statistic_dict = {
     "exp_fit": ExpFitStatistic,
     "phasetd_exp_fit_fgbg_norm_tha": ExpFitFgBgNormTHAStatistic,
     "phasetd_exp_fit_fgbg_norm_marg": ExpFitFgBgNormMARGStatistic,
+    "phasetd_exp_fit_fgbg_norm_marg_exact": ExpFitFgBgNormMARGExactStatistic,
 }
 
 

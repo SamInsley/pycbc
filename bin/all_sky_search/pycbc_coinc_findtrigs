@@ -69,6 +69,14 @@ parser.add_argument('--stage-input', action='store_true',
                          "access by multiple processes")
 parser.add_argument('--stage-input-dir', type=str, default='/dev/shm',
                     help="Directory to stage input files")
+parser.add_argument("--exact-grid-file",
+                    help="Marginalisation grid file, for the "
+                         "phasetd_exp_fit_fgbg_norm_marg_exact statistic")
+parser.add_argument("--exact-psd-files", nargs='+',
+                    action=MultiDetOptionAction,
+                    help="Merged PSD file of each ifo, for the "
+                         "phasetd_exp_fit_fgbg_norm_marg_exact statistic. "
+                         "Given as IFO:FILE pairs, e.g. H1:H1-MERGE_PSDS.hdf")
 stat.insert_statistic_option_group(parser)
 cuts.insert_cuts_option_group(parser)
 args = parser.parse_args()
@@ -159,6 +167,19 @@ for sngl in trigs.singles:
     sngl.segs = coinc_segs
     sngl.valid = veto.segments_to_start_end(sngl.segs)
 
+# The exact-coincident-term statistic needs the template bank, the
+# marginalisation grid and the PSDs: pass them on as statistic keywords
+if args.ranking_statistic == 'phasetd_exp_fit_fgbg_norm_marg_exact':
+    args.statistic_keywords = list(args.statistic_keywords or [])
+    given = [k.split(':')[0] for k in args.statistic_keywords]
+    if 'exact_bank' not in given:
+        args.statistic_keywords.append('exact_bank:%s' % args.template_bank)
+    if args.exact_grid_file and 'exact_grid' not in given:
+        args.statistic_keywords.append('exact_grid:%s' % args.exact_grid_file)
+    for ifo, fname in (args.exact_psd_files or {}).items():
+        if 'exact_psd_%s' % ifo not in given:
+            args.statistic_keywords.append('exact_psd_%s:%s' % (ifo, fname))
+
 # Stat class instance to calculate the coinc ranking statistic
 rank_method = stat.get_statistic_from_opts(args, trigs.ifos)
 
@@ -202,6 +223,11 @@ logging.info("%d out of %d templates kept after applying template cuts",
 # in addition to these lists of coinc info, will also store trigger times and
 # ids in each ifo
 data = {'stat': [], 'decimation_factor': [], 'timeslide_id': [], 'template_id': []}
+# The exact statistic also gives the flow statistic of the same coincs:
+# store it as 'stat_flow' so the two can be compared coinc by coinc
+EXACT = hasattr(rank_method, 'last_flow')
+if EXACT:
+    data['stat_flow'] = []
 for ifo in trigs.ifos:
     data['%s/time' % ifo] = []
     data['%s/trigger_id' % ifo] = []
@@ -382,6 +408,8 @@ def process_template(tnum):
                 to_shift=trigs.to_shift,
                 time_addition=args.coinc_threshold
             )
+            if EXACT:
+                cflow = rank_method.last_flow
 
             #index values of the zerolag triggers
             fi = numpy.where(slide == 0)[0]
@@ -395,6 +423,8 @@ def process_template(tnum):
             ids = {i: t[ti] for i, t in ids.items()}
 
             cstat = cstat[ti]
+            if EXACT:
+                cflow = cflow[ti]
             slide = slide[ti]
             dec = numpy.concatenate([numpy.ones(len(fi)), numpy.repeat(total_factors[-1], len(bl))])
 
@@ -458,10 +488,29 @@ def process_template(tnum):
                 set_slide = set_slide[above]
                 test_single_info = [(i, sds[i][test_ids[i]]) for i in trigs.ifos]
 
+                # Skip coincs whose upper bound is below this threshold: they
+                # could not be kept at this decimation level anyway
+                if hasattr(rank_method, 'coinc_upper_bound') and \
+                        not getattr(rank_method, 'check_bound', False) and \
+                        len(set_slide):
+                    ub = rank_method.coinc_upper_bound(
+                        test_single_info, set_slide, args.timeslide_interval,
+                        to_shift=trigs.to_shift,
+                        time_addition=args.coinc_threshold)
+                    passb = ub >= threshes[kidx]
+                    rank_method.bound_tested += len(passb)
+                    rank_method.bound_passed += int(passb.sum())
+                    test_ids = {i: v[passb] for i, v in test_ids.items()}
+                    set_slide = set_slide[passb]
+                    test_single_info = [(i, sds[i][test_ids[i]])
+                                        for i in trigs.ifos]
+
                 test_cstat = rank_method.rank_stat_coinc(
                     test_single_info, set_slide, args.timeslide_interval,
                     to_shift=trigs.to_shift,
                     time_addition=args.coinc_threshold)
+                if EXACT:
+                    test_flow = rank_method.last_flow
 
                 # Keep triggers in the current decimation range
                 test_bi = numpy.where(test_cstat >= threshes[kidx])[0]
@@ -470,6 +519,8 @@ def process_template(tnum):
                 for i in trigs.ifos:
                     ids[i] = numpy.concatenate([ids[i], test_ids[i][test_bi]])
                 cstat = numpy.concatenate([cstat, test_cstat[test_bi]])
+                if EXACT:
+                    cflow = numpy.concatenate([cflow, test_flow[test_bi]])
                 slide = numpy.concatenate([slide, set_slide[test_bi]])
                 dec = numpy.concatenate([dec, numpy.repeat(total_factors[kidx - 1], len(test_bi))])
 
@@ -480,6 +531,8 @@ def process_template(tnum):
                 local_data['%s/time' % ifo] += [addtime]
                 local_data['%s/trigger_id' % ifo] += [addtriggerid]
             local_data['stat'] += [cstat]
+            if EXACT:
+                local_data['stat_flow'] += [cflow]
             local_data['decimation_factor'] += [dec]
             local_data['timeslide_id'] += [slide]
             local_data['template_id'] += [numpy.repeat(tnum, len(slide))]
@@ -493,6 +546,81 @@ else:
     p = pool.BroadcastPool(args.nprocesses)
     ldatas = p.map(process_template, list(template_ids))
 
+if hasattr(rank_method, 'n_exact'):
+    logging.info('Exact coincident term computed for %d coincs, flow value '
+                 'used for %d (exact term not available)',
+                 rank_method.n_exact, rank_method.n_fallback)
+    ex = rank_method.exact
+    logging.info('Exact term settings: method %s, quiet nodes (delay, '
+                 'azimuth, polarisation) %s every %d-th orientation, loud '
+                 'nodes %s, reference nodes %s, quiet below network SNR %.1f, '
+                 'PSDs per %s, flow %s', ex.method, ex.q_nodes,
+                 ex.quiet_orient_step, ex.l_nodes, ex.r_nodes, ex.quiet_snr,
+                 ex.psd_mode, 'on' if rank_method.compute_flow else 'off')
+    logging.info('Exact term time: %.0f s on template setup (%.0f s '
+                 'harmonics, %.0f s responses), %.0f s on the coincs '
+                 'themselves (%d quiet, %d loud)', ex.t_setup, ex.t_raws,
+                 ex.t_resp, ex.t_coinc, ex.n_quiet, ex.n_loud)
+    if getattr(ex, 'fbar_used', None):
+        fb = numpy.array(ex.fbar_used)
+        logging.info('Exact term time-phase correction: template mean '
+                     'frequency median %.1f Hz (10-90%%: %.1f-%.1f Hz)',
+                     numpy.median(fb), numpy.percentile(fb, 10),
+                     numpy.percentile(fb, 90))
+    if getattr(ex, 'n_bterms', 0):
+        logging.info('Exact term bound: per-trigger terms for %d triggers in '
+                     '%.0f s', ex.n_bterms, ex.t_bterms)
+    if getattr(ex, 'n_refined', 0):
+        logging.info('Exact term: %d quiet coincs above %.1f recomputed with '
+                     'the loud settings', ex.n_refined, ex.refine_above)
+    if ex.n_quiet + ex.n_loud:
+        logging.info('Exact term time per coinc: %.3f ms',
+                     1e3 * ex.t_coinc / (ex.n_quiet + ex.n_loud))
+    if rank_method.bound_tested:
+        logging.info('Upper bound: %d candidate coincs at the denser slides, '
+                     '%d (%.2f%%) could reach their threshold and were '
+                     'computed', rank_method.bound_tested,
+                     rank_method.bound_passed,
+                     100. * rank_method.bound_passed
+                     / rank_method.bound_tested)
+    if rank_method.bound_checked:
+        e = numpy.array(rank_method.bound_excess)
+        logging.info('Bound check: %d of %d coincs above their bound; stat - '
+                     'bound median %.2f, 99%% %.2f, max %.2f',
+                     rank_method.bound_viol, rank_method.bound_checked,
+                     numpy.median(e), numpy.percentile(e, 99), e.max())
+    if ex.check_diffs:
+        d = numpy.array(ex.check_diffs)
+        f = numpy.array(ex.check_full)
+        kd = numpy.array(ex.check_kind)
+        # keep the spot checks for plotting (next to the output file)
+        try:
+            numpy.savez(os.path.splitext(args.output_file)[0]
+                        .replace('.tmp', '') + '_checks.npz', diff=d,
+                        reference=f, kind=kd)
+        except Exception as e:  # pylint:disable=broad-except
+            logging.warning('Could not save the spot checks: %s', e)
+        for kind in ['quiet', 'loud']:
+            mk = kd == kind
+            if not mk.any():
+                continue
+            logging.info('%s-coinc accuracy, %d spot checks against the '
+                         '%s: median %.3f, rms %.3f, max |.| %.3f',
+                         kind.capitalize(), mk.sum(), ex.check_ref,
+                         numpy.median(d[mk]),
+                         numpy.sqrt(numpy.mean(d[mk] ** 2)),
+                         numpy.max(numpy.abs(d[mk])))
+            edges = numpy.percentile(f[mk], [0, 50, 90, 100])
+            for lo_, hi_, lab in zip(edges[:-1], edges[1:],
+                                     ['lowest 50%', '50-90%', 'top 10%']):
+                m = mk & (f >= lo_) & (f <= hi_)
+                if not m.any():
+                    continue
+                logging.info('  %s of values (%.1f to %.1f): %d checks, '
+                             'median %.3f, rms %.3f, max |.| %.3f', lab, lo_,
+                             hi_, m.sum(), numpy.median(d[m]),
+                             numpy.sqrt(numpy.mean(d[m] ** 2)),
+                             numpy.max(numpy.abs(d[m])))
 logging.info('merging data from the templates')
 for ldata in ldatas:
     for key in data:
