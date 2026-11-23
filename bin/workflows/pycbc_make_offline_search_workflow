@@ -299,6 +299,38 @@ ifo_precedence_list = workflow.cp.get_opt_tags('workflow-coincidence', 'timeslid
 for ifo, _ in zip(*insps.categorize_by_attr('ifo')):
     ifo_ids[ifo] = ifo_precedence_list.index(ifo)
 
+# Calculate the inspiral psds
+psd_files = []
+trig_generated_name = 'TRIGGERS_GENERATED'
+trig_generated_segs = {}
+data_analysed_name = 'DATA_ANALYSED'
+data_analysed_segs = {}
+insp_files_seg_dict = segments.segmentlistdict()
+
+for ifo, files in zip(*ind_insps.categorize_by_attr('ifo')):
+    trig_generated_segs[ifo] = segments.segmentlist([f.segment for f in files])
+    data_analysed_segs[ifo] = \
+        segments.segmentlist([f.metadata['data_seg'] for f in files])
+
+    # Remove duplicates from splitbank
+    trig_generated_segs[ifo] = \
+        segments.segmentlist(set(trig_generated_segs[ifo]))
+    data_analysed_segs[ifo] = \
+        segments.segmentlist(set(data_analysed_segs[ifo]))
+
+    insp_files_seg_dict[ifo + ":" + trig_generated_name] = \
+                                                       trig_generated_segs[ifo]
+    insp_files_seg_dict[ifo + ":" + data_analysed_name] = \
+                                                        data_analysed_segs[ifo]
+
+    if datafind_files:
+        frame_files = datafind_files.find_output_with_ifo(ifo)
+    else:
+        frame_files = None
+    psd_files += [wf.setup_psd_calculate(workflow, frame_files, ifo,
+              data_analysed_segs[ifo], data_analysed_name, 'psds')]
+
+
 # Generate the possible detector combinations
 if workflow.cp.has_option_tags('workflow-data_quality', 'no-coinc-veto',
                                 tags=None):
@@ -319,7 +351,8 @@ for ifocomb in ifo_combos(ifo_ids.keys()):
 
     bg_file = wf.setup_interval_coinc(
         workflow, hdfbank, inspcomb, statfiles, coinc_veto_file,
-        final_veto_name, output_dir, pivot_ifo, fixed_ifo, tags=ctagcomb)
+        final_veto_name, output_dir, pivot_ifo, fixed_ifo, tags=ctagcomb,
+        psd_files=psd_files)
 
     # Optionally perform follow-up on triggers and rerank the candidates
     # Returns the input file if not enabled.
@@ -396,37 +429,6 @@ censored_veto_name = 'closed_box'
 censored_veto = wf.make_foreground_censored_veto(workflow,
                        combined_bg_file, final_veto_file, final_veto_name,
                        censored_veto_name, 'segments')
-
-# Calculate the inspiral psds
-psd_files = []
-trig_generated_name = 'TRIGGERS_GENERATED'
-trig_generated_segs = {}
-data_analysed_name = 'DATA_ANALYSED'
-data_analysed_segs = {}
-insp_files_seg_dict = segments.segmentlistdict()
-
-for ifo, files in zip(*ind_insps.categorize_by_attr('ifo')):
-    trig_generated_segs[ifo] = segments.segmentlist([f.segment for f in files])
-    data_analysed_segs[ifo] = \
-        segments.segmentlist([f.metadata['data_seg'] for f in files])
-
-    # Remove duplicates from splitbank
-    trig_generated_segs[ifo] = \
-        segments.segmentlist(set(trig_generated_segs[ifo]))
-    data_analysed_segs[ifo] = \
-        segments.segmentlist(set(data_analysed_segs[ifo]))
-
-    insp_files_seg_dict[ifo + ":" + trig_generated_name] = \
-                                                       trig_generated_segs[ifo]
-    insp_files_seg_dict[ifo + ":" + data_analysed_name] = \
-                                                        data_analysed_segs[ifo]
-
-    if datafind_files:
-        frame_files = datafind_files.find_output_with_ifo(ifo)
-    else:
-        frame_files = None
-    psd_files += [wf.setup_psd_calculate(workflow, frame_files, ifo,
-              data_analysed_segs[ifo], data_analysed_name, 'psds')]
 
 insp_files_seg_file = wf.SegFile.from_segment_list_dict('INSP_SEGMENTS',
                  insp_files_seg_dict, valid_segment=workflow.analysis_time,
@@ -738,7 +740,8 @@ for inj_file, tag in zip(inj_files, inj_tags):
             output_dir,
             pivot_ifo,
             fixed_ifo,
-            tags=ctagcomb
+            tags=ctagcomb,
+            psd_files=psd_files
         )
 
         # Rerank events

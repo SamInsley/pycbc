@@ -486,10 +486,22 @@ def setup_sngls_statmap_inj(workflow, ifo, sngls_inj_files, background_file,
     return stat_node.output_files[0]
 
 
+def exact_psd_opt(node, exe, psd_files, ifos):
+    """Add --exact-psd-files IFO:<merged psd> to a coinc node when the
+    ranking statistic is the exact one and the ini does not set it."""
+    if psd_files is None or exe.has_opt('exact-psd-files'):
+        return
+    if 'marg_exact' not in (exe.get_opt('ranking-statistic') or ''):
+        return
+    files = [f for f in psd_files if f.ifo in ifos]
+    node.add_multiifo_input_list_opt('--exact-psd-files', files)
+
+
 def setup_interval_coinc_inj(workflow, hdfbank,
                              inj_trig_files, stat_files,
                              background_file, veto_file, veto_name,
-                             out_dir, pivot_ifo, fixed_ifo, tags=None):
+                             out_dir, pivot_ifo, fixed_ifo, tags=None,
+                             psd_files=None):
     """
     This function sets up exact match coincidence for injections
     """
@@ -524,6 +536,7 @@ def setup_interval_coinc_inj(workflow, hdfbank,
                                                pivot_ifo,
                                                fixed_ifo,
                                                tags=['JOB'+str(i)])
+        exact_psd_opt(coinc_node, findcoinc_exe, psd_files, ifiles.keys())
         bg_files += coinc_node.output_files
         workflow.add_node(coinc_node)
 
@@ -536,7 +549,7 @@ def setup_interval_coinc_inj(workflow, hdfbank,
 
 def setup_interval_coinc(workflow, hdfbank, trig_files, stat_files,
                          veto_file, veto_name, out_dir, pivot_ifo,
-                         fixed_ifo, tags=None):
+                         fixed_ifo, tags=None, psd_files=None):
     """
     This function sets up exact match coincidence
     """
@@ -565,6 +578,7 @@ def setup_interval_coinc(workflow, hdfbank, trig_files, stat_files,
                                                pivot_ifo,
                                                fixed_ifo,
                                                tags=['JOB'+str(i)])
+        exact_psd_opt(coinc_node, findcoinc_exe, psd_files, ifos)
         bg_files += coinc_node.output_files
         workflow.add_node(coinc_node)
 
