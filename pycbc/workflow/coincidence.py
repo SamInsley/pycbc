@@ -92,9 +92,9 @@ class PyCBCFindCoincExecutable(Executable):
     """Find coinc triggers using a folded interval method"""
 
     current_retention_level = Executable.ALL_TRIGGERS
-    # the exact statistic's grid and merged-PSD files are job inputs too
+    # the exact statistic's merged-PSD files are job inputs; its grid is passed by path
     file_input_options = Executable.file_input_options + [
-        '--exact-grid-file', '--exact-psd-files']
+        '--exact-psd-files']
     def create_node(self, trig_files, bank_file, stat_files, veto_file,
                     veto_name, template_str, pivot_ifo, fixed_ifo, tags=None):
         if tags is None:
